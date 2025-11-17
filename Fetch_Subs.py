@@ -25,9 +25,9 @@ OPENSUBTITLES_API_KEY = os.environ.get("OPENSUBTITLES_API_KEY")
 # REQUIRED by OpenSubtitles – must be a real app name/version string
 USER_AGENT = "MySubFetcher/1.0"
 
-# Self-imposed limits (tuned for free-tier)
-MAX_DOWNLOADS_PER_24H = 5
-API_CALL_MIN_INTERVAL = 1.1  # seconds between API calls
+# Self-imposed limits (tuned for free/dev-tier)
+MAX_DOWNLOADS_PER_24H = 20       # tweak as you like
+API_CALL_MIN_INTERVAL = 1.0      # seconds between API calls
 
 # Where we track recent downloads
 STATE_FILE = Path.home() / ".fetch_subs_opensubtitles_state.json"
@@ -212,7 +212,7 @@ def search_subtitles(title: str, year: Optional[int], language: str = PREFERRED_
 def download_subtitle_file(file_id: int, dest_path: Path):
     """
     Download a subtitle file identified by file_id and save it to dest_path.
-    Sets DAILY_LIMIT_REACHED and stops further work when limit is hit.
+    Sets DAILY_LIMIT_REACHED when limit is hit.
     """
     global DAILY_LIMIT_REACHED
 
@@ -305,13 +305,12 @@ def process_target(target: Path):
     global DAILY_LIMIT_REACHED
 
     if target.is_file():
-        if DAILY_LIMIT_REACHED:
-            print("\nDaily limit already reached — stopping.")
-            sys.exit(2)
         if target.suffix.lower() == ".mp4":
             ensure_subtitles_for_video(target)
         else:
             print(f"Not an mp4: {target}")
+        if DAILY_LIMIT_REACHED:
+            print("\nDaily limit reached — stopping.")
         return
 
     if target.is_dir():
@@ -319,7 +318,7 @@ def process_target(target: Path):
         for p in sorted(target.rglob("*.mp4")):
             if DAILY_LIMIT_REACHED:
                 print("\nDaily limit reached — stopping early.")
-                sys.exit(2)
+                break
             ensure_subtitles_for_video(p)
         return
 
@@ -337,6 +336,10 @@ def main():
 
     target = Path(sys.argv[1]).expanduser().resolve()
     process_target(target)
+
+    # Always exit 0 unless something raised an uncaught exception
+    # (Jenkins will see success even when limit was reached)
+    return
 
 
 if __name__ == "__main__":
