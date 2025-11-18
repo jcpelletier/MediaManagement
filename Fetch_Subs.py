@@ -17,7 +17,7 @@ OPENSUBTITLES_API_URL = "https://api.opensubtitles.com/api/v1/subtitles"
 OPENSUBTITLES_DOWNLOAD_URL = "https://api.opensubtitles.com/api/v1/download"
 OPENSUBTITLES_API_KEY = os.environ.get("OPENSUBTITLES_API_KEY")
 USER_AGENT = "MySubFetcher/1.0"
-MAX_DOWNLOADS_PER_24H = 20
+MAX_DOWNLOADS_PER_24H = 25
 API_CALL_MIN_INTERVAL = 1.0
 STATE_FILE = Path.home() / ".fetch_subs_opensubtitles_state.json"
 
