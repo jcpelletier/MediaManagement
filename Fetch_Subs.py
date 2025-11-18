@@ -270,15 +270,15 @@ def search_subtitles(title: str, year: Optional[int], language: str = PREFERRED_
         rating = attrs.get("ratings", 0) or 0
         downloads = attrs.get("download_count", 0) or 0
         upload_date = attrs.get("upload_date", "unknown")[:10]
-        machine = "⚠️MT" if attrs.get("machine_translated") else ""
-        ai = "⚠️AI" if attrs.get("ai_translated") else ""
+        machine = "[MT]" if attrs.get("machine_translated") else ""
+        ai = "[AI]" if attrs.get("ai_translated") else ""
         hi = "[HI]" if attrs.get("hearing_impaired") else ""
         
         print(f"    {i}. Score: {score:.1f} | Rating: {rating}/10 | "
               f"Downloads: {downloads} | Uploaded: {upload_date} {machine}{ai}{hi}")
     
     best_score, best_result = scored_results[0]
-    print(f"\n  ✓ Selected best subtitle (score: {best_score:.1f})")
+    print(f"\n  [OK] Selected best subtitle (score: {best_score:.1f})")
     return best_result
 
 def download_subtitle_file(file_id: int, dest_path: Path):
