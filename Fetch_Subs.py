@@ -17,7 +17,7 @@ OPENSUBTITLES_API_URL = "https://api.opensubtitles.com/api/v1/subtitles"
 OPENSUBTITLES_DOWNLOAD_URL = "https://api.opensubtitles.com/api/v1/download"
 OPENSUBTITLES_API_KEY = os.environ.get("OPENSUBTITLES_API_KEY")
 USER_AGENT = "MySubFetcher/1.0"
-MAX_DOWNLOADS_PER_24H = 22
+MAX_DOWNLOADS_PER_24H = 20
 API_CALL_MIN_INTERVAL = 1.0
 STATE_FILE = Path.home() / ".fetch_subs_opensubtitles_state.json"
 
@@ -30,6 +30,8 @@ MAX_RESULTS_TO_FETCH = 20  # Get more results to score
 
 _last_api_call_ts: float = 0.0
 DAILY_LIMIT_REACHED: bool = False
+CONSECUTIVE_FAILURES: int = 0
+MAX_CONSECUTIVE_FAILURES: int = 5
 
 # ----------------------------------- 
 # Rate limit helpers
@@ -274,8 +276,15 @@ def search_subtitles(title: str, year: Optional[int], language: str = PREFERRED_
         ai = "[AI]" if attrs.get("ai_translated") else ""
         hi = "[HI]" if attrs.get("hearing_impaired") else ""
         
+        # Get release/file name
+        release = attrs.get("release", "")
+        files = attrs.get("files", [])
+        filename = files[0].get("file_name", "") if files else ""
+        display_name = release or filename or "unknown"
+        
         print(f"    {i}. Score: {score:.1f} | Rating: {rating}/10 | "
               f"Downloads: {downloads} | Uploaded: {upload_date} {machine}{ai}{hi}")
+        print(f"       File: {display_name}")
     
     best_score, best_result = scored_results[0]
     print(f"\n  [OK] Selected best subtitle (score: {best_score:.1f})")
@@ -313,9 +322,13 @@ def is_in_extras_folder(path: Path) -> bool:
     return any(part.lower() == "extras" for part in path.parts)
 
 def ensure_subtitles_for_video(video_path: Path, language: str = PREFERRED_LANGUAGE):
-    global DAILY_LIMIT_REACHED
+    global DAILY_LIMIT_REACHED, CONSECUTIVE_FAILURES
     if DAILY_LIMIT_REACHED:
         return
+    
+    if CONSECUTIVE_FAILURES >= MAX_CONSECUTIVE_FAILURES:
+        print(f"\n!!! {MAX_CONSECUTIVE_FAILURES} consecutive failures detected. Stopping script. !!!")
+        sys.exit(1)
     
     if is_in_extras_folder(video_path):
         print(f"Skipping (Extras folder): {video_path}")
@@ -323,11 +336,13 @@ def ensure_subtitles_for_video(video_path: Path, language: str = PREFERRED_LANGU
     
     if not video_path.exists():
         print(f"File not found: {video_path}")
+        CONSECUTIVE_FAILURES += 1
         return
     
     subs_path = video_path.with_suffix(f".{language}.srt")
     if subs_path.exists():
         print(f"Skipping (already exists): {subs_path}")
+        CONSECUTIVE_FAILURES = 0  # Reset on success (skip counts as success)
         return
     
     title, year = parse_title_and_year(video_path.name)
@@ -338,21 +353,26 @@ def ensure_subtitles_for_video(video_path: Path, language: str = PREFERRED_LANGU
         result = search_subtitles(title, year, language)
     except Exception as e:
         print(f"  Error talking to OpenSubtitles: {e}")
+        CONSECUTIVE_FAILURES += 1
         return
     
     if not result:
+        CONSECUTIVE_FAILURES += 1
         return
     
     files = result.get("attributes", {}).get("files", [])
     if not files:
         print("  Entry has no downloadable files.")
+        CONSECUTIVE_FAILURES += 1
         return
     
     file_id = files[0]["file_id"]
     try:
         download_subtitle_file(file_id, subs_path)
+        CONSECUTIVE_FAILURES = 0  # Reset on successful download
     except Exception as e:
         print(f"  Error downloading subtitle file: {e}")
+        CONSECUTIVE_FAILURES += 1
         if subs_path.exists() and subs_path.stat().st_size == 0:
             subs_path.unlink(missing_ok=True)
 
