@@ -7,13 +7,7 @@ A small collection of Python scripts for managing media files.
 1. **Install system tools**
    - [ffmpeg](https://ffmpeg.org/) is required for video conversion (used by `Convert_Video.py`).
    - `ffsubsync` depends on `ffmpeg` for audio analysis; ensure `ffmpeg` is on your `PATH`.
-2. **Create a virtual environment (recommended)**
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   python -m pip install --upgrade pip
-   ```
-3. **Install Python dependencies**
+2. **Install Python dependencies**
    ```bash
    pip install ffsubsync requests
    ```
