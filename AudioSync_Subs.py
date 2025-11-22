@@ -1,18 +1,19 @@
 import sys
 import os
 import logging
-import ffsubsync
-import ffsubsync.cli as cli
-from ffsubsync.constants import OFFSET_NOT_FOUND, OFFSET_TOO_LARGE
+import subprocess
 
 # --- Configuration ---
 LOG_FILE = 'ffsubsync_audit.log'
 
 # Max offset in seconds. If ffsubsync finds an offset greater than this,
-# the subtitle is considered mismatched.
+# the subtitle is considered mismatched and ffsubsync will fail.
 MAX_OFFSET_SECONDS = 60
 
-# Threshold for treating subtitles as essentially synced.
+# We can use this threshold just for our own logging.
+# Note: we don't have the numeric offset from the CLI, so this is currently
+# only used conceptually; the actual suppression is done by ffsubsync itself
+# via --suppress-output-if-offset-less-than.
 SYNC_THRESHOLD_SECONDS = 5
 
 # Video file extensions to search for
@@ -53,6 +54,7 @@ def find_movie_pairs(root_dir):
             if ext in VIDEO_EXTS:
                 files_by_stem[name_stem]['video'] = os.path.join(dirpath, filename)
             elif ext in SUB_EXTS:
+                # Take the first subtitle we see for a given stem
                 if files_by_stem[name_stem]['sub'] is None:
                     files_by_stem[name_stem]['sub'] = os.path.join(dirpath, filename)
 
@@ -66,37 +68,54 @@ def find_movie_pairs(root_dir):
 
 def process_sync(video_path, subtitle_path):
     """
-    Attempts to auto-sync a single video/subtitle pair using ffsubsync.
+    Attempts to auto-sync a single video/subtitle pair using ffsubsync CLI.
     Overwrites the original subtitle file.
     """
     logging.info(f"Processing: {os.path.basename(video_path)}")
     logging.info(f"Subtitle: {os.path.basename(subtitle_path)}")
 
+    # Build ffsubsync CLI command:
+    #   ffsubsync <video> -i <sub> --overwrite-input --max-offset-seconds N --suppress-output-if-offset-less-than 0.01
+    cmd = [
+        "ffsubsync",
+        video_path,
+        "-i", subtitle_path,
+        "--overwrite-input",
+        "--max-offset-seconds", str(MAX_OFFSET_SECONDS),
+        "--suppress-output-if-offset-less-than", "0.01",
+    ]
+
     try:
-        sync_args = cli.SyncArgs(
-            reference=video_path,
-            srtin=[subtitle_path],
-            srtout=subtitle_path,
-            max_offset_seconds=MAX_OFFSET_SECONDS,
-            suppress_output_if_offset_less_than=0.01
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True
         )
 
-        offset = ffsubsync.ffsubsync(sync_args)
+        if result.returncode != 0:
+            logging.error("SYNC FAILURE: ffsubsync exited with non-zero status.")
+            if result.stdout:
+                logging.error(f"ffsubsync stdout:\n{result.stdout}")
+            if result.stderr:
+                logging.error(f"ffsubsync stderr:\n{result.stderr}")
+            return None
 
-        if offset == OFFSET_NOT_FOUND:
-            logging.error("SYNC FAILURE: Could not find any alignment. Subtitle likely does not match audio.")
-
-        elif offset == OFFSET_TOO_LARGE:
-            logging.error(f"SYNC FAILURE: Required offset exceeded {MAX_OFFSET_SECONDS} seconds.")
-
-        elif abs(offset) < SYNC_THRESHOLD_SECONDS:
-            logging.info(f"Already Synced: Minor drift correction applied ({offset:.3f}s).")
-
+        # At this point, ffsubsync reported success and overwrote the input file.
+        # We don't get the numeric offset directly from the CLI, but we can at
+        # least log that the sync completed.
+        if result.stdout.strip():
+            logging.info("SYNC SUCCESS. ffsubsync output:")
+            logging.info(result.stdout.strip())
         else:
-            logging.warning(f"SYNC SUCCESS: Applied time correction of {offset:.3f}s.")
+            logging.info("SYNC SUCCESS. No output (likely a very small offset or suppressed output).")
 
-        return offset
+        return True
 
+    except FileNotFoundError:
+        logging.critical(
+            "ffsubsync command not found. Ensure ffsubsync is installed and on the PATH for this Jenkins job."
+        )
+        return None
     except Exception as e:
         logging.error(f"UNEXPECTED ERROR during sync of {os.path.basename(video_path)}: {e}")
         return None
