@@ -20,6 +20,9 @@ USER_AGENT = "MySubFetcher/1.0"
 MAX_DOWNLOADS_PER_24H = 25
 API_CALL_MIN_INTERVAL = 1.0
 STATE_FILE = Path.home() / ".fetch_subs_opensubtitles_state.json"
+STRICT_FILENAME_MATCH = True
+FILENAME_MATCH_BONUS = 20
+FILENAME_MISMATCH_PENALTY = 50
 
 # Quality thresholds
 MIN_RATING = 6.0  # Minimum acceptable rating (0-10 scale)
@@ -32,6 +35,33 @@ _last_api_call_ts: float = 0.0
 DAILY_LIMIT_REACHED: bool = False
 CONSECUTIVE_FAILURES: int = 0
 MAX_CONSECUTIVE_FAILURES: int = 5
+
+
+def _normalize_title_string(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def title_in_release_or_filename(attrs: dict, title: str) -> bool:
+    target_norm = _normalize_title_string(title)
+    if not target_norm:
+        return False
+
+    release = attrs.get("release", "") or ""
+    files = attrs.get("files", [])
+    filename = files[0].get("file_name", "") if files else ""
+
+    for candidate in (release, filename):
+        candidate_norm = _normalize_title_string(candidate)
+        if candidate_norm and target_norm in candidate_norm:
+            return True
+    return False
+
+
+def display_name_for_result(attrs: dict) -> str:
+    release = attrs.get("release", "") or ""
+    files = attrs.get("files", [])
+    filename = files[0].get("file_name", "") if files else ""
+    return release or filename or "unknown"
 
 # ----------------------------------- 
 # Rate limit helpers
@@ -141,11 +171,17 @@ def calculate_quality_score(result: dict, title: str) -> float:
         movie_lower = movie_name.lower()
         if title_lower in movie_lower or movie_lower in title_lower:
             score += 15
-    
+
     # 7. Prefer non-foreign parts only
     if attrs.get("foreign_parts_only"):
         score -= 40
-    
+
+    # 8. Reward filename/release strings that contain the title; penalize those that do not
+    if title_in_release_or_filename(attrs, title):
+        score += FILENAME_MATCH_BONUS
+    else:
+        score -= FILENAME_MISMATCH_PENALTY
+
     return score
 
 def filter_and_rank_results(results: List[dict], title: str) -> List[Tuple[float, dict]]:
@@ -161,15 +197,18 @@ def filter_and_rank_results(results: List[dict], title: str) -> List[Tuple[float
         # Hard filters
         rating = attrs.get("ratings", 0) or 0
         downloads = attrs.get("download_count", 0) or 0
-        
+
         # Skip if below minimum thresholds
         if rating < MIN_RATING and rating > 0:  # rating=0 means unrated, allow those
             continue
-        
+
         # Skip foreign parts only
         if attrs.get("foreign_parts_only"):
             continue
-            
+
+        if STRICT_FILENAME_MATCH and not title_in_release_or_filename(attrs, title):
+            continue
+
         score = calculate_quality_score(result, title)
         scored.append((score, result))
     
@@ -260,9 +299,15 @@ def search_subtitles(title: str, year: Optional[int], language: str = PREFERRED_
     
     # Score and rank all results
     scored_results = filter_and_rank_results(all_results, title)
-    
+
     if not scored_results:
         print("  No subtitles passed quality filters.")
+        print("  Checked releases/filenames:")
+        for result in all_results:
+            attrs = result.get("attributes", {})
+            display_name = display_name_for_result(attrs)
+            name_matches = title_in_release_or_filename(attrs, title)
+            print(f"    - {display_name} | Title in name: {'yes' if name_matches else 'no'}")
         return None
     
     # Show top 3 candidates
@@ -276,15 +321,12 @@ def search_subtitles(title: str, year: Optional[int], language: str = PREFERRED_
         ai = "[AI]" if attrs.get("ai_translated") else ""
         hi = "[HI]" if attrs.get("hearing_impaired") else ""
         
-        # Get release/file name
-        release = attrs.get("release", "")
-        files = attrs.get("files", [])
-        filename = files[0].get("file_name", "") if files else ""
-        display_name = release or filename or "unknown"
-        
+        display_name = display_name_for_result(attrs)
+        name_matches = title_in_release_or_filename(attrs, title)
+
         print(f"    {i}. Score: {score:.1f} | Rating: {rating}/10 | "
               f"Downloads: {downloads} | Uploaded: {upload_date} {machine}{ai}{hi}")
-        print(f"       File: {display_name}")
+        print(f"       File: {display_name} | Title in name: {'yes' if name_matches else 'no'}")
     
     best_score, best_result = scored_results[0]
     print(f"\n  [OK] Selected best subtitle (score: {best_score:.1f})")
