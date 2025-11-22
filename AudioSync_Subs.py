@@ -10,17 +10,8 @@ LOG_FILE = 'ffsubsync_audit.log'
 # the subtitle is considered mismatched and ffsubsync will fail.
 MAX_OFFSET_SECONDS = 60
 
-# We can use this threshold just for our own logging.
-# Note: we don't have the numeric offset from the CLI, so this is currently
-# only used conceptually; the actual suppression is done by ffsubsync itself
-# via --suppress-output-if-offset-less-than.
-SYNC_THRESHOLD_SECONDS = 5
-
 # Video file extensions to search for
 VIDEO_EXTS = ['.mp4', '.mkv', '.avi', '.mov']
-
-# Subtitle file extensions
-SUB_EXTS = ['.srt']
 
 # Setup Logger
 logging.basicConfig(
@@ -36,7 +27,16 @@ logging.basicConfig(
 def find_movie_pairs(root_dir):
     """
     Scans the directory for video/subtitle pairs.
-    A pair is defined by having the same name but different extensions.
+
+    Video:
+        Any file ending with one of VIDEO_EXTS.
+        Stem is the filename without the extension, e.g. "Movie" from "Movie.mp4".
+
+    Subtitle:
+        Only files ending with ".en.srt" are considered.
+        Stem is the filename with the ".en.srt" removed, e.g. "Movie" from "Movie.en.srt".
+
+    A pair is made when a video stem and subtitle stem match.
     """
     logging.info(f"Starting scan of directory: {root_dir}")
     movie_pairs = {}
@@ -45,19 +45,37 @@ def find_movie_pairs(root_dir):
         files_by_stem = {}
 
         for filename in filenames:
+            full_lower = filename.lower()
             name_stem, ext = os.path.splitext(filename)
             ext = ext.lower()
 
-            if name_stem not in files_by_stem:
-                files_by_stem[name_stem] = {'video': None, 'sub': None}
+            video_stem = None
+            sub_stem = None
 
+            # Identify videos by extension
             if ext in VIDEO_EXTS:
-                files_by_stem[name_stem]['video'] = os.path.join(dirpath, filename)
-            elif ext in SUB_EXTS:
-                # Take the first subtitle we see for a given stem
-                if files_by_stem[name_stem]['sub'] is None:
-                    files_by_stem[name_stem]['sub'] = os.path.join(dirpath, filename)
+                video_stem = name_stem  # e.g. "Jumanji (1995)" from "Jumanji (1995).mp4"
 
+            # Identify English subtitles only: must end with ".en.srt"
+            # e.g. "Jumanji (1995).en.srt" -> stem "Jumanji (1995)"
+            if full_lower.endswith(".en.srt"):
+                sub_stem = filename[:-len(".en.srt")]
+
+            # Register video
+            if video_stem:
+                if video_stem not in files_by_stem:
+                    files_by_stem[video_stem] = {'video': None, 'sub': None}
+                files_by_stem[video_stem]['video'] = os.path.join(dirpath, filename)
+
+            # Register subtitle (English only)
+            if sub_stem:
+                if sub_stem not in files_by_stem:
+                    files_by_stem[sub_stem] = {'video': None, 'sub': None}
+                # Only take the first .en.srt for a given stem
+                if files_by_stem[sub_stem]['sub'] is None:
+                    files_by_stem[sub_stem]['sub'] = os.path.join(dirpath, filename)
+
+        # Build final pairs for this directory
         for stem, files in files_by_stem.items():
             if files['video'] and files['sub']:
                 movie_pairs[files['video']] = files['sub']
@@ -74,8 +92,9 @@ def process_sync(video_path, subtitle_path):
     logging.info(f"Processing: {os.path.basename(video_path)}")
     logging.info(f"Subtitle: {os.path.basename(subtitle_path)}")
 
-    # Build ffsubsync CLI command:
-    #   ffsubsync <video> -i <sub> --overwrite-input --max-offset-seconds N --suppress-output-if-offset-less-than 0.01
+    # ffsubsync command:
+    #   ffsubsync <video> -i <sub> --overwrite-input
+    #   --max-offset-seconds N --suppress-output-if-offset-less-than 0.01
     cmd = [
         "ffsubsync",
         video_path,
@@ -100,9 +119,6 @@ def process_sync(video_path, subtitle_path):
                 logging.error(f"ffsubsync stderr:\n{result.stderr}")
             return None
 
-        # At this point, ffsubsync reported success and overwrote the input file.
-        # We don't get the numeric offset directly from the CLI, but we can at
-        # least log that the sync completed.
         if result.stdout.strip():
             logging.info("SYNC SUCCESS. ffsubsync output:")
             logging.info(result.stdout.strip())
