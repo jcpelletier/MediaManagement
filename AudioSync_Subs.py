@@ -1,13 +1,14 @@
 import sys
 import os
 import logging
-from ffsubsync import ffsubsync, cli
+import ffsubsync
+import ffsubsync.cli as cli
 from ffsubsync.constants import OFFSET_NOT_FOUND, OFFSET_TOO_LARGE
 
 # --- Configuration ---
 LOG_FILE = 'ffsubsync_audit.log'
 
-# Max offset in seconds. If ffsubsync finds an offset greater than this, 
+# Max offset in seconds. If ffsubsync finds an offset greater than this,
 # the subtitle is considered mismatched.
 MAX_OFFSET_SECONDS = 60
 
@@ -29,6 +30,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+
 
 def find_movie_pairs(root_dir):
     """
@@ -61,6 +63,7 @@ def find_movie_pairs(root_dir):
     logging.info(f"Found {len(movie_pairs)} video/subtitle pairs to process.")
     return movie_pairs
 
+
 def process_sync(video_path, subtitle_path):
     """
     Attempts to auto-sync a single video/subtitle pair using ffsubsync.
@@ -78,7 +81,7 @@ def process_sync(video_path, subtitle_path):
             suppress_output_if_offset_less_than=0.01
         )
 
-        offset = ffsubsync(sync_args)
+        offset = ffsubsync.ffsubsync(sync_args)
 
         if offset == OFFSET_NOT_FOUND:
             logging.error("SYNC FAILURE: Could not find any alignment. Subtitle likely does not match audio.")
@@ -97,6 +100,7 @@ def process_sync(video_path, subtitle_path):
     except Exception as e:
         logging.error(f"UNEXPECTED ERROR during sync of {os.path.basename(video_path)}: {e}")
         return None
+
 
 def main():
     """
@@ -119,6 +123,7 @@ def main():
 
     logging.info("Script Finished.")
     logging.info(f"Full log output saved to: {os.path.abspath(LOG_FILE)}")
+
 
 if __name__ == "__main__":
     main()
