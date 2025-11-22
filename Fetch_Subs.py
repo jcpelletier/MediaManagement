@@ -166,7 +166,6 @@ def calculate_quality_score(result: dict, title: str) -> float:
     feature_details = attrs.get("feature_details", {})
     movie_name = feature_details.get("movie_name", "")
     if movie_name:
-        # Simple fuzzy match - you can enhance this
         title_lower = title.lower()
         movie_lower = movie_name.lower()
         if title_lower in movie_lower or movie_lower in title_lower:
@@ -184,19 +183,36 @@ def calculate_quality_score(result: dict, title: str) -> float:
 
     return score
 
-def filter_and_rank_results(results: List[dict], title: str) -> List[Tuple[float, dict]]:
+def filter_and_rank_results(
+    results: List[dict],
+    title: str,
+    name_filter: Optional[str] = None
+) -> List[Tuple[float, dict]]:
     """
     Filter and rank subtitle results by quality score.
     Returns list of (score, result) tuples, sorted best first.
+    If name_filter is provided, only results whose release/filename
+    contain that substring (case-insensitive) are kept.
     """
     scored = []
+    name_filter_lower = name_filter.lower() if name_filter else None
     
     for result in results:
         attrs = result.get("attributes", {})
         
         # Hard filters
         rating = attrs.get("ratings", 0) or 0
-        downloads = attrs.get("download_count", 0) or 0
+        downloads = attrs.get("download_count", 0) or 0  # currently unused, but retained
+        
+        # Optional filename/release filter
+        if name_filter_lower:
+            release = attrs.get("release", "") or ""
+            files = attrs.get("files", [])
+            filename = files[0].get("file_name", "") if files else ""
+            combined = f"{release} {filename}".lower()
+            if name_filter_lower not in combined:
+                # Skip this result if filter substring not found
+                continue
 
         # Skip if below minimum thresholds
         if rating < MIN_RATING and rating > 0:  # rating=0 means unrated, allow those
@@ -261,12 +277,21 @@ def _search_once(params: dict, label: str) -> Optional[List[dict]]:
         return None
     return results
 
-def search_subtitles(title: str, year: Optional[int], language: str = PREFERRED_LANGUAGE):
+def search_subtitles(
+    title: str,
+    year: Optional[int],
+    language: str = PREFERRED_LANGUAGE,
+    name_filter: Optional[str] = None
+):
     """
     Search for subtitles with quality scoring.
     Returns best result dict or None.
+    If name_filter is provided, only results whose release/filename
+    contain that substring are considered.
     """
     print("  Searching subtitles...")
+    if name_filter:
+        print(f"  Applying filename/release filter: '{name_filter}'")
     
     all_results = []
     
@@ -298,10 +323,12 @@ def search_subtitles(title: str, year: Optional[int], language: str = PREFERRED_
         return None
     
     # Score and rank all results
-    scored_results = filter_and_rank_results(all_results, title)
+    scored_results = filter_and_rank_results(all_results, title, name_filter=name_filter)
 
     if not scored_results:
         print("  No subtitles passed quality filters.")
+        if name_filter:
+            print(f"  (Including filename/release filter: '{name_filter}')")
         print("  Checked releases/filenames:")
         for result in all_results:
             attrs = result.get("attributes", {})
@@ -363,7 +390,11 @@ def download_subtitle_file(file_id: int, dest_path: Path):
 def is_in_extras_folder(path: Path) -> bool:
     return any(part.lower() == "extras" for part in path.parts)
 
-def ensure_subtitles_for_video(video_path: Path, language: str = PREFERRED_LANGUAGE):
+def ensure_subtitles_for_video(
+    video_path: Path,
+    language: str = PREFERRED_LANGUAGE,
+    name_filter: Optional[str] = None
+):
     global DAILY_LIMIT_REACHED, CONSECUTIVE_FAILURES
     if DAILY_LIMIT_REACHED:
         return
@@ -392,7 +423,7 @@ def ensure_subtitles_for_video(video_path: Path, language: str = PREFERRED_LANGU
     print(f"  Parsed -> title='{title}', year={year}")
     
     try:
-        result = search_subtitles(title, year, language)
+        result = search_subtitles(title, year, language, name_filter=name_filter)
     except Exception as e:
         print(f"  Error talking to OpenSubtitles: {e}")
         CONSECUTIVE_FAILURES += 1
@@ -418,11 +449,11 @@ def ensure_subtitles_for_video(video_path: Path, language: str = PREFERRED_LANGU
         if subs_path.exists() and subs_path.stat().st_size == 0:
             subs_path.unlink(missing_ok=True)
 
-def process_target(target: Path):
+def process_target(target: Path, name_filter: Optional[str] = None):
     global DAILY_LIMIT_REACHED
     if target.is_file():
         if target.suffix.lower() == ".mp4":
-            ensure_subtitles_for_video(target)
+            ensure_subtitles_for_video(target, name_filter=name_filter)
         else:
             print(f"Not an mp4: {target}")
         if DAILY_LIMIT_REACHED:
@@ -435,18 +466,19 @@ def process_target(target: Path):
             if DAILY_LIMIT_REACHED:
                 print("\nDaily limit reached — stopping early.")
                 break
-            ensure_subtitles_for_video(p)
+            ensure_subtitles_for_video(p, name_filter=name_filter)
         return
     
     print(f"Invalid target: {target}")
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python fetch_subs.py <video_file_or_directory>")
+        print("Usage: python fetch_subs.py <video_file_or_directory> [name_filter]")
         sys.exit(1)
     
     target = Path(sys.argv[1]).expanduser().resolve()
-    process_target(target)
+    name_filter = sys.argv[2] if len(sys.argv) >= 3 else None
+    process_target(target, name_filter=name_filter)
 
 if __name__ == "__main__":
     main()
