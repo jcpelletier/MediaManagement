@@ -269,7 +269,12 @@ def main() -> None:
     print(f"Extensions: {', '.join(extensions)}")
     print(f"Minimum confidence: {args.min_confidence}")
 
-    subfolders = [p for p in source_root.iterdir() if p.is_dir()]
+    processed_root_resolved = processed_root.resolve()
+    subfolders = [
+        p
+        for p in source_root.iterdir()
+        if p.is_dir() and p.resolve() != processed_root_resolved
+    ]
     if not subfolders:
         print("No subdirectories found to process.")
         return

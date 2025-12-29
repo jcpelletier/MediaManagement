@@ -62,6 +62,7 @@ Renames and moves ripped movies by asking OpenAI to guess the movie title from t
 python Sort_Rips.py [--source D:\Video] [--dest D:\Media\Movies] [--processed D:\Video\Processed] [--extensions .mkv,.mp4,...] [--min-confidence 0.6] [--overwrite] [--dry-run]
 ```
 - Scans each immediate subfolder of `--source` for video files (default extensions include `.mkv`, `.mp4`, `.avi`, `.mov`, `.wmv`, `.m4v`, `.mpg`, `.mpeg`, `.ts`, `.flv`).
+- Automatically skips the configured `--processed` directory to avoid reprocessing prior results.
 - Sends a concise folder+file summary to the OpenAI API and expects JSON containing `title`, optional `year`, and `confidence`.
 - Renames the largest video file in the folder to `Title.ext` or `Title (Year).ext` and moves it into `--dest`.
 - Skips if the model returns a low/empty title or confidence below `--min-confidence`.
