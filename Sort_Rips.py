@@ -114,7 +114,8 @@ def call_openai(folder_name: str, files_summary: str, api_key: str) -> Optional[
 
 
 def sanitize_title(title: str) -> str:
-    return re.sub(r"[<>:\\"/\\|?*]+", " ", title).strip()
+    # Remove characters that are invalid in Windows filenames.
+    return re.sub(r'[<>:"/\\|?*]+', " ", title).strip()
 
 
 def rename_and_move(largest_file: Path, guess: FolderGuess, dest_root: Path, overwrite: bool, dry_run: bool) -> None:
