@@ -152,6 +152,15 @@ def rename_and_move(largest_file: Path, guess: FolderGuess, dest_root: Path, ove
 
 
 def move_folder_to_processed(folder: Path, processed_root: Path, dry_run: bool) -> None:
+    if not any(folder.iterdir()):
+        print(f"  Delete empty folder: {folder}")
+        if not dry_run:
+            try:
+                folder.rmdir()
+            except Exception as exc:  # noqa: BLE001
+                print(f"ERROR: Could not delete empty folder '{folder}': {exc}")
+        return
+
     target = processed_root / folder.name
 
     if folder.resolve() == target.resolve():

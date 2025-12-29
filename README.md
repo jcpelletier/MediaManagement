@@ -68,3 +68,4 @@ python Sort_Rips.py [--source D:\Video] [--dest D:\Media\Movies] [--processed D:
 - Existing destination files are preserved unless `--overwrite` is provided.
 - Use `--dry-run` to preview actions without renaming or moving files.
 - After a folder is reviewed, it is moved to a `Processed` directory inside `--source` by default (override with `--processed`) so it is not re-checked.
+- Empty source folders are deleted instead of being moved.
