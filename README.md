@@ -50,3 +50,23 @@ python AudioSync_Subs.py "/path/to/library"
 - Scans the directory recursively for matching video/subtitle pairs (same filename stem).
 - Overwrites the subtitle file with the synced version and writes a log to `ffsubsync_audit.log`.
 
+### Sort_Rips.py
+Renames and moves ripped movies by asking OpenAI to guess the movie title from the folder name and contained video files. Intended for one-movie-per-folder rips; ambiguous folders (e.g., TV shows) are skipped.
+
+**Prerequisites**
+- Set `OPENAI_API_KEY` in your environment.
+- Python dependencies: `requests`
+
+**Usage**
+```bash
+python Sort_Rips.py [--source D:\Video] [--dest D:\Media\Movies] [--processed D:\Video\Processed] [--extensions .mkv,.mp4,...] [--min-confidence 0.6] [--overwrite] [--dry-run]
+```
+- Scans each immediate subfolder of `--source` for video files (default extensions include `.mkv`, `.mp4`, `.avi`, `.mov`, `.wmv`, `.m4v`, `.mpg`, `.mpeg`, `.ts`, `.flv`).
+- Automatically skips the configured `--processed` directory to avoid reprocessing prior results.
+- Sends a concise folder+file summary to the OpenAI API and expects JSON containing `title`, optional `year`, and `confidence`.
+- Renames the largest video file in the folder to `Title.ext` or `Title (Year).ext` and moves it into `--dest`.
+- Skips if the model returns a low/empty title or confidence below `--min-confidence`.
+- Existing destination files are preserved unless `--overwrite` is provided.
+- Use `--dry-run` to preview actions without renaming or moving files.
+- After a folder is reviewed, it is moved to a `Processed` directory inside `--source` by default (override with `--processed`) so it is not re-checked.
+- Empty source folders are deleted instead of being moved.
