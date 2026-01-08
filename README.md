@@ -34,11 +34,13 @@ Downloads high-quality subtitles from OpenSubtitles for a single `.mp4` file or 
 
 **Usage**
 ```bash
-python Fetch_Subs.py /path/to/video_or_directory
+python Fetch_Subs.py /path/to/video_or_directory [name_filter]
 ```
 - Requires `OPENSUBTITLES_API_KEY` to be set.
+- Optional `name_filter` restricts results to releases/filenames that contain the provided substring.
 - Saves subtitles next to each video as `<video>.en.srt` by default.
-- Skips files inside `Extras/` folders and stops early when the OpenSubtitles daily limit is reached.
+- Skips files inside `Extras/` folders and stops early when the OpenSubtitles daily limit is reached (tracked in `~/.fetch_subs_opensubtitles_state.json`).
+- Applies quality filters (minimum rating, avoids machine/AI translated results by default) when ranking candidates.
 
 ### AudioSync_Subs.py
 Auto-syncs existing `.srt` subtitle files with their matching video tracks using `ffsubsync`.
