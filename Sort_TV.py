@@ -8,7 +8,13 @@ Path 2 (LLM-assisted) + API verification:
     - search TV series
     - fetch season episode list
     - confirm or correct episode number/title
-- Rename in-place to: "{Show} - SxxEyy - {Title}.mkv"
+- Rename in-place (default) to: "{Show} - SxxEyy - {Title}.mkv"
+- Optional: if --parent-path is provided, move the (renamed) file to:
+    {parent_path}/Season {season}/
+
+Rules:
+- If file is not renamed (low confidence / non-episode / verify failed / etc.), it is NOT moved.
+- No overwrites: if target exists, skip.
 
 Requires:
 - ffprobe / ffmpeg on PATH (FFmpeg)
@@ -16,16 +22,13 @@ Requires:
 - requests
 - OPENAI_API_KEY env var set
 - TMDB_API_KEY env var set (or pass --tmdb-api-key)
-
-TMDB endpoints used:
-- /3/search/tv
-- /3/tv/{series_id}/season/{season_number}
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -47,6 +50,9 @@ PRIMARY_AUDIO_SECONDS = 120.0
 AUDIO_START_SECONDS_HARDCODED = 600.0
 
 DEFAULT_FALLBACK_AUDIO_SECONDS = 300.0
+
+# When FALLBACK is used, start it 2 minutes AFTER the previous sampled window ends.
+FALLBACK_START_GAP_SECONDS = 120.0
 
 INVALID_FILENAME_CHARS = r'<>:"/\\|?*'
 
@@ -82,7 +88,6 @@ def short_path(p: Path, max_len: int = 90) -> str:
 
 
 def norm_title(s: str) -> str:
-    # Normalization for matching titles
     s = (s or "").lower().strip()
     s = re.sub(r"&", "and", s)
     s = re.sub(r"[^a-z0-9\s]", " ", s)
@@ -428,13 +433,6 @@ class TmdbEpisode:
 
 
 class TmdbClient:
-    """
-    Minimal TMDB v3 client for TV show season episode lists.
-
-    Endpoints:
-    - GET https://api.themoviedb.org/3/search/tv
-    - GET https://api.themoviedb.org/3/tv/{series_id}/season/{season_number}
-    """
     def __init__(self, api_key: str, timeout_s: float = 10.0):
         self.api_key = api_key
         self.timeout_s = timeout_s
@@ -461,7 +459,6 @@ class TmdbClient:
             self._tv_id_cache[key] = None
             return None
 
-        # Pick the first result; optionally you could improve with year matching.
         tv_id = results[0].get("id")
         tv_id = int(tv_id) if tv_id else None
         self._tv_id_cache[key] = tv_id
@@ -503,33 +500,17 @@ def verify_or_correct_with_tmdb(
 ) -> VerificationResult:
     tv_id = tmdb.find_tv_id(show)
     if not tv_id:
-        return VerificationResult(
-            ok=False,
-            corrected=False,
-            episode_number=None,
-            episode_title=None,
-            match_score=0.0,
-            reason="tmdb: show not found"
-        )
+        return VerificationResult(False, False, None, None, 0.0, "tmdb: show not found")
 
     episodes = tmdb.get_season_episodes(tv_id, season)
     if not episodes:
-        return VerificationResult(
-            ok=False,
-            corrected=False,
-            episode_number=None,
-            episode_title=None,
-            match_score=0.0,
-            reason="tmdb: season not found or has no episodes"
-        )
+        return VerificationResult(False, False, None, None, 0.0, "tmdb: season not found or has no episodes")
 
-    # 1) If episode number exists, verify title similarity
     ep_by_num = {e.episode_number: e for e in episodes}
     if proposed_ep_num in ep_by_num:
         canon = ep_by_num[proposed_ep_num]
         score = similarity(proposed_title, canon.name)
         if score >= min_title_match:
-            # Confirm (and optionally replace title with canonical)
             return VerificationResult(
                 ok=True,
                 corrected=(norm_title(proposed_title) != norm_title(canon.name)),
@@ -539,7 +520,6 @@ def verify_or_correct_with_tmdb(
                 reason="tmdb: confirmed by episode number + title match"
             )
 
-    # 2) Otherwise match title across all episodes and pick best
     best = None
     best_score = 0.0
     for e in episodes:
@@ -559,7 +539,6 @@ def verify_or_correct_with_tmdb(
             reason="tmdb: corrected by title-to-season match"
         )
 
-    # 3) Fail verification
     return VerificationResult(
         ok=False,
         corrected=False,
@@ -571,25 +550,57 @@ def verify_or_correct_with_tmdb(
 
 
 # ----------------------------
-# Rename
+# Rename (+ optional move to --parent-path/Season N/)
 # ----------------------------
 
-def rename_in_place(src: Path, show: str, season: int, ep: int, title: str, dry_run: bool) -> bool:
+def compute_target_dir(
+    src: Path,
+    season: int,
+    parent_path: Optional[Path],
+) -> Path:
+    if not parent_path:
+        return src.parent
+    return parent_path / f"Season {season}"
+
+
+def rename_and_maybe_move(
+    src: Path,
+    show: str,
+    season: int,
+    ep: int,
+    title: str,
+    dry_run: bool,
+    parent_path: Optional[Path],
+) -> bool:
     show_s = sanitize_filename(show)
     title_s = sanitize_filename(title)
     new_name = f"{show_s} - S{season:02d}E{ep:02d} - {title_s}{src.suffix}"
-    dst = src.with_name(new_name)
+
+    target_dir = compute_target_dir(src, season, parent_path)
+    dst = target_dir / new_name
 
     if dst.exists():
         print(f"[SKIP ] target exists: {src.name} -> {dst.name}")
         return False
 
     if dry_run:
-        print(f"[RENAME] DRYRUN {src.name} -> {dst.name}")
+        if parent_path:
+            print(f"[RENAME] DRYRUN {src.name} -> {dst.name}")
+            print(f"[MOVE  ] DRYRUN -> {short_path(target_dir, 110)}")
+        else:
+            print(f"[RENAME] DRYRUN {src.name} -> {dst.name}")
         return True
 
-    src.rename(dst)
-    print(f"[RENAME] {src.name} -> {dst.name}")
+    # Ensure destination folder exists if moving (or even if "in place", harmless).
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # One-step move+rename (works across volumes).
+    shutil.move(str(src), str(dst))
+    if parent_path:
+        print(f"[RENAME] {src.name} -> {dst.name}")
+        print(f"[MOVE  ] -> {short_path(target_dir, 110)}")
+    else:
+        print(f"[RENAME] {src.name} -> {dst.name}")
     return True
 
 
@@ -605,7 +616,15 @@ def main():
     ap.add_argument("--max-minutes", type=float, default=55.0, help="Skip files longer than this (default: 55)")
     ap.add_argument("--min-confidence", type=float, default=0.85, help="Only consider LLM result when confidence >= this (default: 0.85)")
     ap.add_argument("--max-sub-lines", type=int, default=80, help="Subtitle lines to include (default: 80)")
-    ap.add_argument("--dry-run", action="store_true", help="Print planned renames, do not rename.")
+    ap.add_argument("--dry-run", action="store_true", help="Print planned renames/moves, do not rename/move.")
+
+    # NEW: Optional move destination parent
+    ap.add_argument(
+        "--parent-path",
+        default=None,
+        help='Optional show parent folder (e.g. "Star Trek The Next Generation"). '
+             'If set, renamed episodes are moved to "{parent}/Season N/".'
+    )
 
     # Audio fallback strategy:
     ap.add_argument("--audio-fallback", action="store_true", default=True,
@@ -629,6 +648,11 @@ def main():
 
     verbose = not args.quiet
     audio_fallback_enabled = (not args.no_audio_fallback) and bool(args.audio_fallback)
+
+    parent_path = Path(args.parent_path).expanduser().resolve() if args.parent_path else None
+    if parent_path and not parent_path.exists() and not args.dry_run:
+        # We'll create season dirs under it, but parent itself should exist.
+        raise SystemExit(f"--parent-path does not exist: {parent_path}")
 
     def vlog(msg: str) -> None:
         if verbose:
@@ -665,9 +689,14 @@ def main():
     vlog(
         f"Audio fallback: {'ON' if audio_fallback_enabled else 'OFF'} "
         f"(primary {PRIMARY_AUDIO_SECONDS:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s, "
-        f"fallback {args.audio_seconds:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s)"
+        f"fallback {args.audio_seconds:.0f}s @ (primary_end + {FALLBACK_START_GAP_SECONDS:.0f}s))"
     )
-    vlog(f"TMDB verify: {'ON' if verify_api_enabled else 'OFF'} (min title match {args.tmdb_min_title_match:.2f})\n")
+    vlog(f"TMDB verify: {'ON' if verify_api_enabled else 'OFF'} (min title match {args.tmdb_min_title_match:.2f})")
+    if parent_path:
+        vlog(f"Move after rename: ON → {parent_path} / Season N")
+    else:
+        vlog("Move after rename: OFF")
+    vlog("")
 
     total = 0
     renamed = 0
@@ -739,13 +768,13 @@ def main():
                 if verbose:
                     print(f"[EVID ] subtitles → \"{one_line(subtitle_excerpt)}\"")
 
-        def attempt_audio_transcribe(seconds: float, stage: str) -> Optional[str]:
+        def attempt_audio_transcribe(start_seconds: float, seconds: float, stage: str) -> Optional[str]:
             with tempfile.TemporaryDirectory() as td:
                 wav_path = Path(td) / "clip.wav"
                 ok = extract_audio_clip_wav(
                     mkv,
                     wav_path,
-                    AUDIO_START_SECONDS_HARDCODED,
+                    start_seconds,
                     seconds,
                     verbose=verbose
                 )
@@ -770,22 +799,43 @@ def main():
         audio_transcript_primary = None
         audio_transcript_fallback = None
 
+        last_audio_start: Optional[float] = None
+        last_audio_seconds: Optional[float] = None
+
+        def compute_fallback_start(prev_start: float, prev_seconds: float) -> float:
+            return float(prev_start) + float(prev_seconds) + float(FALLBACK_START_GAP_SECONDS)
+
         if evidence_text is None and audio_fallback_enabled:
-            audio_transcript_primary = attempt_audio_transcribe(PRIMARY_AUDIO_SECONDS, "PRIMARY")
+            primary_start = AUDIO_START_SECONDS_HARDCODED
+            audio_transcript_primary = attempt_audio_transcribe(primary_start, PRIMARY_AUDIO_SECONDS, "PRIMARY")
+            last_audio_start = primary_start
+            last_audio_seconds = PRIMARY_AUDIO_SECONDS
+
             if audio_transcript_primary:
                 evidence_text = audio_transcript_primary
-                evidence_kind = f"audio transcript (Whisper, {PRIMARY_AUDIO_SECONDS:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s)"
+                evidence_kind = f"audio transcript (Whisper, {PRIMARY_AUDIO_SECONDS:.0f}s @ {primary_start:.0f}s)"
                 used_audio_primary += 1
             else:
                 fallback_seconds = float(args.audio_seconds)
                 if fallback_seconds < PRIMARY_AUDIO_SECONDS:
                     fallback_seconds = PRIMARY_AUDIO_SECONDS
+
+                fallback_start = compute_fallback_start(last_audio_start, last_audio_seconds)
+
                 if verbose:
-                    print(f"[RETRY] PRIMARY transcript unavailable → trying FALLBACK {fallback_seconds:.0f}s")
-                audio_transcript_fallback = attempt_audio_transcribe(fallback_seconds, "FALLBACK")
+                    print(
+                        f"[RETRY] PRIMARY transcript unavailable → trying FALLBACK "
+                        f"{fallback_seconds:.0f}s @ {fallback_start:.0f}s "
+                        f"(prev window was {last_audio_seconds:.0f}s @ {last_audio_start:.0f}s + {FALLBACK_START_GAP_SECONDS:.0f}s)"
+                    )
+
+                audio_transcript_fallback = attempt_audio_transcribe(fallback_start, fallback_seconds, "FALLBACK")
+                last_audio_start = fallback_start
+                last_audio_seconds = fallback_seconds
+
                 if audio_transcript_fallback:
                     evidence_text = audio_transcript_fallback
-                    evidence_kind = f"audio transcript (Whisper, {fallback_seconds:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s)"
+                    evidence_kind = f"audio transcript (Whisper, {fallback_seconds:.0f}s @ {fallback_start:.0f}s)"
                     used_audio_fallback += 1
 
         if evidence_text is None:
@@ -824,7 +874,6 @@ def main():
             if not isinstance(ep_num, int) or not ep_title:
                 return False, result, "missing_fields"
 
-            # ---- TMDB VERIFY/CORRECT HERE ----
             final_ep_num = ep_num
             final_title = ep_title
 
@@ -858,7 +907,15 @@ def main():
                 final_ep_num = vres.episode_number
                 final_title = vres.episode_title
 
-            ok = rename_in_place(mkv, show, season, final_ep_num, final_title, args.dry_run)
+            ok = rename_and_maybe_move(
+                mkv,
+                show,
+                season,
+                final_ep_num,
+                final_title,
+                args.dry_run,
+                parent_path=parent_path,
+            )
             if ok:
                 return True, result, "renamed"
             return False, result, "target_exists"
@@ -879,16 +936,23 @@ def main():
             if fallback_seconds < PRIMARY_AUDIO_SECONDS:
                 fallback_seconds = PRIMARY_AUDIO_SECONDS
 
+            primary_start = AUDIO_START_SECONDS_HARDCODED
+            primary_seconds = PRIMARY_AUDIO_SECONDS
+            fallback_start = primary_start + primary_seconds + FALLBACK_START_GAP_SECONDS
+
             if verbose:
-                print(f"[RETRY] primary evidence didn't pass → trying FALLBACK transcript ({fallback_seconds:.0f}s)")
+                print(
+                    f"[RETRY] primary evidence didn't pass → trying FALLBACK transcript "
+                    f"({fallback_seconds:.0f}s @ {fallback_start:.0f}s; prev window {primary_seconds:.0f}s @ {primary_start:.0f}s + {FALLBACK_START_GAP_SECONDS:.0f}s)"
+                )
 
             if audio_transcript_fallback is None:
-                audio_transcript_fallback = attempt_audio_transcribe(fallback_seconds, "FALLBACK")
+                audio_transcript_fallback = attempt_audio_transcribe(fallback_start, fallback_seconds, "FALLBACK")
                 if audio_transcript_fallback:
                     used_audio_fallback += 1
 
             if audio_transcript_fallback:
-                fb_kind = f"audio transcript (Whisper, {fallback_seconds:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s)"
+                fb_kind = f"audio transcript (Whisper, {fallback_seconds:.0f}s @ {fallback_start:.0f}s)"
                 renamed_ok2, second_result, fail_code2 = attempt_llm_with_evidence("FALLBACK", audio_transcript_fallback, fb_kind)
                 if renamed_ok2:
                     print("[DONE ] renamed (after fallback)")
