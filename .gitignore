@@ -1,0 +1,14 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Pytest cache
+.pytest_cache/
+
+# Playwright state
+playwright-report/
+
+# Local artifacts from smoke test
+artifacts/
+*.log
