@@ -43,8 +43,8 @@ from openai import OpenAI
 
 PRIMARY_AUDIO_SECONDS = 120.0
 
-# Shift audio sampling to 10 minutes in (600 seconds).
-AUDIO_START_SECONDS_HARDCODED = 600.0
+# Shift audio sampling to 2 minutes in (120 seconds).
+AUDIO_START_SECONDS_HARDCODED = 120.0
 
 DEFAULT_FALLBACK_AUDIO_SECONDS = 300.0
 
@@ -390,6 +390,7 @@ Using ONLY the evidence text below, decide:
 - is_episode (true/false)
 - If is_episode=true: episode_number (1-based integer within the season) and episode_title
 - confidence from 0.0 to 1.0
+Evidence may include multiple separate clips from the same file; they are not necessarily contiguous and should be treated as separate excerpts.
 
 Evidence text:
 \"\"\"
@@ -681,6 +682,8 @@ def main():
                     help="Enable audio transcription when subtitles fail (default: on).")
     ap.add_argument("--no-audio-fallback", action="store_true",
                     help="Disable audio transcription fallback.")
+    ap.add_argument("--audio-start-seconds", type=float, default=AUDIO_START_SECONDS_HARDCODED,
+                    help="Primary audio start offset in seconds (default: 120).")
     ap.add_argument("--audio-seconds", type=float, default=DEFAULT_FALLBACK_AUDIO_SECONDS,
                     help="Fallback audio clip length in seconds (default: 300). Primary is always 120s.")
 
@@ -733,9 +736,12 @@ def main():
     vlog(f"Mode: {'DRY-RUN' if args.dry_run else 'RENAME'} | Model: {args.model} | LLM conf >= {args.min_confidence}")
     vlog(
         f"Audio fallback: {'ON' if audio_fallback_enabled else 'OFF'} "
-        f"(primary {PRIMARY_AUDIO_SECONDS:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s, "
-        f"fallback {args.audio_seconds:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s)"
+        f"(primary {PRIMARY_AUDIO_SECONDS:.0f}s @ {args.audio_start_seconds:.0f}s, "
+        f"second {PRIMARY_AUDIO_SECONDS:.0f}s @ {args.audio_start_seconds + PRIMARY_AUDIO_SECONDS:.0f}s, "
+        f"deep fallback {args.audio_seconds:.0f}s)"
     )
+    if audio_fallback_enabled:
+        vlog("[INFO ] --audio-seconds is used only as a deep fallback after combined clips.")
     vlog(f"TMDB verify: {'ON' if verify_api_enabled else 'OFF'} (min title match {args.tmdb_min_title_match:.2f})\n")
 
     total = 0
@@ -824,54 +830,103 @@ def main():
                 if verbose:
                     print(f"[EVID ] subtitles -> \"{one_line(subtitle_excerpt)}\"")
 
-        def attempt_audio_transcribe(seconds: float, stage: str) -> Optional[str]:
+        def clamp_clip_start(requested_start: float, duration_seconds: float) -> Optional[float]:
+            latest_start = max(0.0, dur_s - duration_seconds - 1.0)
+            if latest_start == 0.0 and dur_s < (duration_seconds + 1.0):
+                return None
+            return min(requested_start, latest_start)
+
+        def attempt_audio_transcribe(seconds: float, stage: str, start_seconds: float) -> Tuple[Optional[str], Optional[float]]:
+            actual_start = clamp_clip_start(start_seconds, seconds)
+            if actual_start is None:
+                if verbose:
+                    print(f"[AUDIO] {stage} clip skipped (duration {seconds:.0f}s exceeds file length {dur_s:.0f}s)")
+                return None, None
+            if verbose:
+                print(f"[AUDIO] {stage} clip attempt ({seconds:.0f}s @ {actual_start:.0f}s)")
             with tempfile.TemporaryDirectory() as td:
                 wav_path = Path(td) / "clip.wav"
                 ok = extract_audio_clip_wav(
                     mkv,
                     wav_path,
-                    AUDIO_START_SECONDS_HARDCODED,
+                    actual_start,
                     seconds,
                     verbose=verbose
                 )
                 if not ok:
                     if verbose:
                         print(f"[ASR  ] {stage} transcript: FAILED (audio extraction)")
-                    return None
+                    return None, None
                 try:
                     tx = transcribe_audio_whisper(client, wav_path)
                 except Exception as e:
                     if verbose:
                         print(f"[ERR  ] {stage} transcription failed: {e}")
-                    return None
+                    return None, None
                 if not tx:
                     if verbose:
                         print(f"[ASR  ] {stage} transcript: EMPTY")
-                    return None
+                    return None, None
                 if verbose:
                     print(f"[ASR  ] {stage} transcript: \"{one_line(tx)}\"")
-                return tx
+                return tx, actual_start
 
         audio_transcript_primary = None
+        audio_transcript_second = None
         audio_transcript_fallback = None
+        primary_actual_start = None
+        second_actual_start = None
+        deep_actual_start = None
+        primary_start = float(args.audio_start_seconds)
+        second_start = primary_start + PRIMARY_AUDIO_SECONDS
+        deep_fallback_start = second_start + PRIMARY_AUDIO_SECONDS
 
         if evidence_text is None and audio_fallback_enabled:
-            audio_transcript_primary = attempt_audio_transcribe(PRIMARY_AUDIO_SECONDS, "PRIMARY")
+            audio_transcript_primary, primary_actual_start = attempt_audio_transcribe(
+                PRIMARY_AUDIO_SECONDS,
+                "PRIMARY",
+                primary_start
+            )
             if audio_transcript_primary:
                 evidence_text = audio_transcript_primary
-                evidence_kind = f"audio transcript (Whisper, {PRIMARY_AUDIO_SECONDS:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s)"
+                evidence_kind = (
+                    f"audio transcript (Whisper, {PRIMARY_AUDIO_SECONDS:.0f}s @ "
+                    f"{primary_actual_start:.0f}s)"
+                )
                 used_audio_primary += 1
             else:
-                fallback_seconds = float(args.audio_seconds)
-                if fallback_seconds < PRIMARY_AUDIO_SECONDS:
-                    fallback_seconds = PRIMARY_AUDIO_SECONDS
                 if verbose:
-                    print(f"[RETRY] PRIMARY transcript unavailable -> trying FALLBACK {fallback_seconds:.0f}s")
-                audio_transcript_fallback = attempt_audio_transcribe(fallback_seconds, "FALLBACK")
-                if audio_transcript_fallback:
-                    evidence_text = audio_transcript_fallback
-                    evidence_kind = f"audio transcript (Whisper, {fallback_seconds:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s)"
+                    print("[RETRY] PRIMARY transcript unavailable -> trying SECOND clip")
+                audio_transcript_second, second_actual_start = attempt_audio_transcribe(
+                    PRIMARY_AUDIO_SECONDS,
+                    "SECOND",
+                    second_start
+                )
+                if audio_transcript_second:
+                    evidence_text = audio_transcript_second
+                    evidence_kind = (
+                        f"audio transcript (Whisper, {PRIMARY_AUDIO_SECONDS:.0f}s @ "
+                        f"{second_actual_start:.0f}s)"
+                    )
                     used_audio_fallback += 1
+                else:
+                    fallback_seconds = float(args.audio_seconds)
+                    if fallback_seconds < PRIMARY_AUDIO_SECONDS:
+                        fallback_seconds = PRIMARY_AUDIO_SECONDS
+                    if verbose:
+                        print(f"[RETRY] SECOND transcript unavailable -> trying DEEP FALLBACK {fallback_seconds:.0f}s")
+                    audio_transcript_fallback, deep_actual_start = attempt_audio_transcribe(
+                        fallback_seconds,
+                        "DEEP",
+                        deep_fallback_start
+                    )
+                    if audio_transcript_fallback:
+                        evidence_text = audio_transcript_fallback
+                        evidence_kind = (
+                            f"audio transcript (Whisper, {fallback_seconds:.0f}s @ "
+                            f"{deep_actual_start:.0f}s)"
+                        )
+                        used_audio_fallback += 1
 
         if evidence_text is None:
             skipped_no_evidence += 1
@@ -959,23 +1014,79 @@ def main():
 
         used_primary_audio = (audio_transcript_primary is not None) and (evidence_text == audio_transcript_primary)
         if used_primary_audio and audio_fallback_enabled:
+            if audio_transcript_second is None:
+                if verbose:
+                    print("[RETRY] primary evidence didn't pass -> trying SECOND clip for combined evidence")
+                audio_transcript_second, second_actual_start = attempt_audio_transcribe(
+                    PRIMARY_AUDIO_SECONDS,
+                    "SECOND",
+                    second_start
+                )
+                if audio_transcript_second:
+                    used_audio_fallback += 1
+
+            if audio_transcript_second:
+                primary_label_start = primary_actual_start if primary_actual_start is not None else primary_start
+                second_label_start = second_actual_start if second_actual_start is not None else second_start
+                combined_evidence = (
+                    f"CLIP A (Whisper transcript, {PRIMARY_AUDIO_SECONDS:.0f}s @ {primary_label_start:.0f}s):\n"
+                    f"\"{audio_transcript_primary}\"\n\n"
+                    f"CLIP B (Whisper transcript, {PRIMARY_AUDIO_SECONDS:.0f}s @ {second_label_start:.0f}s):\n"
+                    f"\"{audio_transcript_second}\""
+                )
+                combined_kind = (
+                    "audio transcript (Whisper, multi-clip: "
+                    f"A {PRIMARY_AUDIO_SECONDS:.0f}s @ {primary_label_start:.0f}s; "
+                    f"B {PRIMARY_AUDIO_SECONDS:.0f}s @ {second_label_start:.0f}s)"
+                )
+                if verbose:
+                    print("[EVID ] combined audio transcripts (A+B)")
+                renamed_ok2, second_result, fail_code2 = attempt_llm_with_evidence(
+                    "FALLBACK",
+                    combined_evidence,
+                    combined_kind
+                )
+                if renamed_ok2:
+                    print("[DONE ] renamed (after combined fallback)")
+                    if args.dry_run:
+                        dryrun += 1
+                    else:
+                        renamed += 1
+                    continue
+
+                if second_result is not None:
+                    first_result = second_result
+                    fail_code = fail_code2
+            else:
+                if verbose:
+                    print("[RETRY] SECOND clip unavailable -> skipping combined evidence")
+
             fallback_seconds = float(args.audio_seconds)
             if fallback_seconds < PRIMARY_AUDIO_SECONDS:
                 fallback_seconds = PRIMARY_AUDIO_SECONDS
-
             if verbose:
-                print(f"[RETRY] primary evidence didn't pass -> trying FALLBACK transcript ({fallback_seconds:.0f}s)")
-
+                print(f"[RETRY] combined evidence didn't pass -> trying DEEP FALLBACK ({fallback_seconds:.0f}s)")
             if audio_transcript_fallback is None:
-                audio_transcript_fallback = attempt_audio_transcribe(fallback_seconds, "FALLBACK")
+                audio_transcript_fallback, deep_actual_start = attempt_audio_transcribe(
+                    fallback_seconds,
+                    "DEEP",
+                    deep_fallback_start
+                )
                 if audio_transcript_fallback:
                     used_audio_fallback += 1
 
             if audio_transcript_fallback:
-                fb_kind = f"audio transcript (Whisper, {fallback_seconds:.0f}s @ {AUDIO_START_SECONDS_HARDCODED:.0f}s)"
-                renamed_ok2, second_result, fail_code2 = attempt_llm_with_evidence("FALLBACK", audio_transcript_fallback, fb_kind)
+                fb_kind = (
+                    f"audio transcript (Whisper, {fallback_seconds:.0f}s @ "
+                    f"{deep_actual_start:.0f}s)"
+                )
+                renamed_ok2, second_result, fail_code2 = attempt_llm_with_evidence(
+                    "DEEP",
+                    audio_transcript_fallback,
+                    fb_kind
+                )
                 if renamed_ok2:
-                    print("[DONE ] renamed (after fallback)")
+                    print("[DONE ] renamed (after deep fallback)")
                     if args.dry_run:
                         dryrun += 1
                     else:
