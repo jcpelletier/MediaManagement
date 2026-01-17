@@ -593,21 +593,18 @@ def verify_or_correct_with_tmdb(
             reason="tmdb: season not found or has no episodes"
         )
 
-    # 1) If episode number exists, verify title similarity
+    # 1) If episode number exists, confirm by number only
     ep_by_num = {e.episode_number: e for e in episodes}
     if proposed_ep_num in ep_by_num:
         canon = ep_by_num[proposed_ep_num]
-        score = similarity(proposed_title, canon.name)
-        if score >= min_title_match:
-            # Confirm (and optionally replace title with canonical)
-            return VerificationResult(
-                ok=True,
-                corrected=(norm_title(proposed_title) != norm_title(canon.name)),
-                episode_number=canon.episode_number,
-                episode_title=canon.name,
-                match_score=score,
-                reason="tmdb: confirmed by episode number + title match"
-            )
+        return VerificationResult(
+            ok=True,
+            corrected=(norm_title(proposed_title) != norm_title(canon.name)),
+            episode_number=canon.episode_number,
+            episode_title=canon.name,
+            match_score=1.0,
+            reason="tmdb: confirmed by episode number"
+        )
 
     # 2) Otherwise match title across all episodes and pick best
     best = None
@@ -626,7 +623,7 @@ def verify_or_correct_with_tmdb(
             episode_number=best.episode_number,
             episode_title=best.name,
             match_score=best_score,
-            reason="tmdb: corrected by title-to-season match"
+            reason="tmdb: corrected by title match"
         )
 
     # 3) Fail verification
@@ -696,7 +693,7 @@ def main():
     ap.add_argument("--tmdb-api-key", default=None,
                     help="TMDB API key (or set TMDB_API_KEY env var).")
     ap.add_argument("--tmdb-min-title-match", type=float, default=0.78,
-                    help="Minimum title similarity (0-1) to confirm/correct using TMDB (default: 0.78).")
+                    help="Minimum title similarity (0-1) used only for TMDB correction by title (default: 0.78).")
     args = ap.parse_args()
 
     verbose = not args.quiet
