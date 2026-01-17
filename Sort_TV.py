@@ -292,6 +292,59 @@ def transcribe_audio_whisper(client: OpenAI, wav_path: Path) -> Optional[str]:
 # Parsing show/season from folder
 # ----------------------------
 
+def parse_show_and_season_with_llm(client: OpenAI, folder_name: str) -> Tuple[Optional[str], Optional[int]]:
+    json_schema_object = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "show": {"type": ["string", "null"]},
+            "season": {"type": ["integer", "null"], "minimum": 1},
+        },
+        "required": ["show", "season"],
+    }
+
+    resp = client.responses.create(
+        model="gpt-5-mini",
+        input=[
+            {
+                "role": "system",
+                "content": "Return only the structured JSON object that matches the schema.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Extract the show name and season number from this folder name. "
+                    "Return only the JSON object.\n\n"
+                    f"Folder name: {folder_name}"
+                ),
+            },
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "show_season_parse",
+                "schema": json_schema_object,
+                "strict": True,
+            }
+        },
+    )
+
+    raw = resp.output_text
+    result = json.loads(raw)
+    show = result.get("show")
+    season = result.get("season")
+
+    if isinstance(show, str):
+        show = show.strip() or None
+    else:
+        show = None
+
+    if not isinstance(season, int) or season < 1:
+        season = None
+
+    return show, season
+
+
 def parse_show_and_season_from_folder(folder_name: str) -> Tuple[Optional[str], Optional[int]]:
     name = folder_name.strip()
     name = re.sub(r"[_]+", " ", name)
@@ -702,7 +755,11 @@ def main():
             continue
 
         folder = mkv.parent.name
-        show, season = parse_show_and_season_from_folder(folder)
+        vlog(f"[PARSE] GPT-5-mini parsing folder name: \"{folder}\"")
+        show, season = parse_show_and_season_with_llm(client, folder)
+        if not show or not season:
+            vlog("[PARSE] GPT-5-mini parse missing fields; falling back to regex parsing.")
+            show, season = parse_show_and_season_from_folder(folder)
         if not show or not season:
             skipped_parse += 1
             print(f"[SKIP ] can't parse show/season from folder: \"{folder}\"")
