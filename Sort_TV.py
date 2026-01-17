@@ -481,6 +481,12 @@ class TmdbEpisode:
     name: str
 
 
+@dataclass
+class TmdbShow:
+    tv_id: int
+    name: str
+
+
 class TmdbClient:
     """
     Minimal TMDB v3 client for TV show season episode lists.
@@ -493,7 +499,7 @@ class TmdbClient:
         self.api_key = api_key
         self.timeout_s = timeout_s
         self.base = "https://api.themoviedb.org/3"
-        self._tv_id_cache: Dict[str, Optional[int]] = {}
+        self._tv_cache: Dict[str, Optional[TmdbShow]] = {}
         self._season_cache: Dict[Tuple[int, int], List[TmdbEpisode]] = {}
 
     def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -504,22 +510,31 @@ class TmdbClient:
         r.raise_for_status()
         return r.json()
 
-    def find_tv_id(self, show_name: str) -> Optional[int]:
+    def find_tv(self, show_name: str) -> Optional[TmdbShow]:
         key = norm_title(show_name)
-        if key in self._tv_id_cache:
-            return self._tv_id_cache[key]
+        if key in self._tv_cache:
+            return self._tv_cache[key]
 
         data = self._get("/search/tv", {"query": show_name, "include_adult": "false"})
         results = data.get("results") or []
         if not results:
-            self._tv_id_cache[key] = None
+            self._tv_cache[key] = None
             return None
 
         # Pick the first result; optionally you could improve with year matching.
-        tv_id = results[0].get("id")
-        tv_id = int(tv_id) if tv_id else None
-        self._tv_id_cache[key] = tv_id
-        return tv_id
+        top = results[0]
+        tv_id = top.get("id")
+        name = top.get("name") or top.get("original_name") or show_name
+        if not tv_id:
+            self._tv_cache[key] = None
+            return None
+        show = TmdbShow(tv_id=int(tv_id), name=str(name))
+        self._tv_cache[key] = show
+        return show
+
+    def find_tv_id(self, show_name: str) -> Optional[int]:
+        show = self.find_tv(show_name)
+        return show.tv_id if show else None
 
     def get_season_episodes(self, tv_id: int, season: int) -> List[TmdbEpisode]:
         ck = (tv_id, season)
@@ -764,6 +779,18 @@ def main():
             skipped_parse += 1
             print(f"[SKIP ] can't parse show/season from folder: \"{folder}\"")
             continue
+
+        if tmdb_client is not None:
+            try:
+                tmdb_show = tmdb_client.find_tv(show)
+            except Exception as e:
+                errors += 1
+                print(f"[ERR  ] TMDB canonicalize failed: {e}")
+                continue
+            if tmdb_show and norm_title(tmdb_show.name) != norm_title(show):
+                if verbose:
+                    print(f"[API  ] TMDB canonical show -> \"{tmdb_show.name}\"")
+                show = tmdb_show.name
 
         dur_s = ffprobe_duration_seconds(mkv)
         if dur_s is None:
