@@ -227,27 +227,39 @@ def transcribe_audio_whisper(client: OpenAI, wav_path: Path) -> Optional[str]:
 # ----------------------------
 
 def parse_show_and_season_from_folder(folder_name: str) -> Tuple[Optional[str], Optional[int]]:
-    name = folder_name.strip()
+    name = (folder_name or "").strip()
     name = re.sub(r"[_]+", " ", name)
-    name = re.sub(r"\s*-\s*", " - ", name)
-    name = re.sub(r"\s+", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
 
-    m = re.search(r"\bSeason\s*(\d{1,2})\b", name, flags=re.IGNORECASE)
-    season = int(m.group(1)) if m else None
-
-    show = name
+    # Accept: "Season 1", "Season1", "S1", "S01", "Series 1"
+    season = None
+    m = re.search(r"\b(?:season|series)\s*(\d{1,2})\b", name, flags=re.IGNORECASE)
     if m:
-        show = name[:m.start()].strip()
-    show = show.rstrip("- ").strip()
+        season = int(m.group(1))
+        show_part = name[:m.start()].strip()
+        tail_part = name[m.end():].strip()
+        show = show_part
+        # If show_part is empty (rare), fall back to stripping tail markers
+        if not show:
+            show = re.sub(r"\b(?:disc|disk|d)\s*\d{1,2}\b", "", name, flags=re.IGNORECASE).strip()
+    else:
+        m = re.search(r"\bS\s*(\d{1,2})\b", name, flags=re.IGNORECASE)
+        if m:
+            season = int(m.group(1))
+            show = name[:m.start()].strip()
+        else:
+            show = name
 
-    if not show:
-        show = None
-
+    show = show.strip(" -_.")
     if show:
+        # normalize separators like "Star Trek- The Next Generation"
         show = show.replace("-", " ")
         show = re.sub(r"\s+", " ", show).strip()
 
-    return show, season
+    # If show is something like "STAR TREK TNG", you might want a custom mapping,
+    # but at least we won't fail parsing season anymore.
+    return (show if show else None), season
+
 
 
 # ----------------------------
