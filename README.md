@@ -72,3 +72,36 @@ python Sort_Rips.py [--source D:\Video] [--dest D:\Media\Movies] [--processed D:
 - Use `--dry-run` to preview actions without renaming or moving files.
 - After a folder is reviewed, it is moved to a `Processed` directory inside `--source` by default (override with `--processed`) so it is not re-checked.
 - Empty source folders are deleted instead of being moved.
+
+### Sort_TV.py
+Renames TV episodes in place by parsing show/season from the parent folder name, extracting subtitle or audio evidence, asking OpenAI to identify the episode, and optionally verifying against TMDB. Can also rename immediately when OpenSubtitles returns an exact file hash match.
+
+**Prerequisites**
+- `ffmpeg` and `ffprobe` on `PATH`
+- `OPENAI_API_KEY` set (LLM and transcription)
+- `TMDB_API_KEY` set (optional verification)
+- `OPENSUB_API_KEY` set (optional OpenSubtitles exact hash rename)
+
+**Usage**
+```bash
+python Sort_TV.py --root /path/to/shows [flags]
+```
+
+**Flags**
+- `--root` Root folder to scan recursively for `.mkv` files (required).
+- `--model` OpenAI model name (default: `gpt-5.2`).
+- `--min-minutes` Skip files shorter than this (default: 20).
+- `--max-minutes` Skip files longer than this (default: 60).
+- `--min-confidence` Minimum LLM confidence required to rename (default: 0.85).
+- `--max-sub-lines` Subtitle lines to include as evidence (default: 80).
+- `--dry-run` Print planned renames without renaming.
+- `--audio-fallback` Enable audio transcription when subtitles fail (default: on).
+- `--no-audio-fallback` Disable audio transcription fallback.
+- `--audio-start-seconds` Start offset for primary audio clip (default: 120).
+- `--audio-seconds` Deep fallback audio clip length in seconds (default: 300).
+- `--opensubtitles-exact-rename` Rename immediately when OpenSubtitles hash lookup returns an exact show/season match.
+- `--opensubtitles-user-agent` User-Agent header for OpenSubtitles API (default: `MediaManagement/1.0`).
+- `--quiet` Reduce logging (only renames/skips/errors).
+- `--no-verify-api` Disable TMDB verification.
+- `--tmdb-api-key` TMDB API key (or use `TMDB_API_KEY` env var).
+- `--tmdb-min-title-match` Minimum title similarity to confirm/correct using TMDB (default: 0.78).
