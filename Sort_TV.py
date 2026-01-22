@@ -936,6 +936,8 @@ def main():
                             renamed += 1
                         renamed_opensubtitles += 1
                         continue
+                elif verbose:
+                    print("[OSDB ] lookup completed, no exact match")
 
         streams = ffprobe_subtitle_streams(mkv)
         if verbose:
