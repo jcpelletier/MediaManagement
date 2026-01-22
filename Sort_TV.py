@@ -27,6 +27,7 @@ import json
 import os
 import re
 import subprocess
+import struct
 import tempfile
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -49,6 +50,9 @@ AUDIO_START_SECONDS_HARDCODED = 120.0
 DEFAULT_FALLBACK_AUDIO_SECONDS = 300.0
 
 INVALID_FILENAME_CHARS = r'<>:"/\\|?*'
+
+OPENSUBTITLES_API_URL = "https://api.opensubtitles.com/api/v1/subtitles"
+OPENSUBTITLES_USER_AGENT = "MediaManagement/1.0"
 
 
 # ----------------------------
@@ -97,6 +101,87 @@ def similarity(a: str, b: str) -> float:
     if not a_n or not b_n:
         return 0.0
     return SequenceMatcher(None, a_n, b_n).ratio()
+
+
+# ----------------------------
+# OpenSubtitles (knowledge boost)
+# ----------------------------
+
+def compute_opensubtitles_hash(file_path: Path) -> Optional[str]:
+    try:
+        size = file_path.stat().st_size
+    except OSError:
+        return None
+
+    # OpenSubtitles hash needs at least 128 KiB (64 KiB head + 64 KiB tail).
+    if size < 131072:
+        return None
+
+    try:
+        with file_path.open("rb") as f:
+            head = f.read(65536)
+            f.seek(max(0, size - 65536))
+            tail = f.read(65536)
+    except OSError:
+        return None
+
+    total = size
+    for buf in (head, tail):
+        for i in range(0, len(buf), 8):
+            (val,) = struct.unpack_from("<Q", buf, i)
+            total = (total + val) & 0xFFFFFFFFFFFFFFFF
+
+    return f"{total:016x}"
+
+
+def opensubtitles_exact_match(
+    api_key: str,
+    user_agent: str,
+    mkv_path: Path,
+    show: str,
+    season: int,
+    timeout_s: float = 10.0,
+) -> Optional[Tuple[int, str]]:
+    moviehash = compute_opensubtitles_hash(mkv_path)
+    if not moviehash:
+        return None
+
+    headers = {
+        "Api-Key": api_key,
+        "User-Agent": user_agent,
+    }
+    params = {
+        "moviehash": moviehash,
+        "moviehash_match": "only",
+        "order_by": "download_count",
+        "order_direction": "desc",
+    }
+
+    r = requests.get(OPENSUBTITLES_API_URL, headers=headers, params=params, timeout=timeout_s)
+    r.raise_for_status()
+    data = r.json().get("data") or []
+
+    show_norm = norm_title(show)
+    for item in data:
+        attrs = item.get("attributes") or {}
+        details = attrs.get("feature_details") or {}
+        parent_title = details.get("parent_title") or details.get("parent_name") or ""
+        season_num = details.get("season_number")
+        ep_num = details.get("episode_number")
+        ep_title = details.get("title") or details.get("feature_title") or ""
+
+        if not isinstance(season_num, int) or not isinstance(ep_num, int):
+            continue
+        if season_num != season:
+            continue
+        if not parent_title or not ep_title:
+            continue
+        if norm_title(parent_title) != show_norm:
+            continue
+
+        return ep_num, str(ep_title)
+
+    return None
 
 
 # ----------------------------
@@ -687,6 +772,12 @@ def main():
     ap.add_argument("--audio-seconds", type=float, default=DEFAULT_FALLBACK_AUDIO_SECONDS,
                     help="Fallback audio clip length in seconds (default: 300). Primary is always 120s.")
 
+    # OpenSubtitles knowledge boost
+    ap.add_argument("--opensubtitles-exact-rename", action="store_true",
+                    help="Rename immediately when OpenSubtitles hash lookup returns an exact show/season match.")
+    ap.add_argument("--opensubtitles-user-agent", default=OPENSUBTITLES_USER_AGENT,
+                    help="OpenSubtitles User-Agent header (default: MediaManagement/1.0).")
+
     # Logging
     ap.add_argument("--quiet", action="store_true", help="Reduce logging (only renames/skips/errors). Default is verbose.")
 
@@ -759,6 +850,7 @@ def main():
     skipped_missing_fields = 0
     skipped_target_exists = 0
     skipped_verify_failed = 0
+    renamed_opensubtitles = 0
 
     used_subtitles = 0
     used_audio_primary = 0
@@ -811,6 +903,39 @@ def main():
             skipped_duration_range += 1
             print(f"[SKIP ] duration {dur_m:.1f}m out of range [{args.min_minutes:.1f}, {args.max_minutes:.1f}]")
             continue
+
+        if args.opensubtitles_exact_rename:
+            api_key = os.environ.get("OPENSUB_API_KEY")
+            if not api_key:
+                if verbose:
+                    print("[OSDB ] OPENSUB_API_KEY not set; skipping OpenSubtitles lookup")
+            else:
+                try:
+                    os_match = opensubtitles_exact_match(
+                        api_key=api_key,
+                        user_agent=args.opensubtitles_user_agent,
+                        mkv_path=mkv,
+                        show=show,
+                        season=season,
+                    )
+                except Exception as e:
+                    errors += 1
+                    print(f"[ERR  ] OpenSubtitles lookup failed: {e}")
+                    os_match = None
+
+                if os_match:
+                    ep_num, ep_title = os_match
+                    if verbose:
+                        print(f"[OSDB ] exact match -> S{season:02d}E{ep_num:02d} \"{ep_title}\"")
+                    ok = rename_in_place(mkv, show, season, ep_num, ep_title, args.dry_run)
+                    if ok:
+                        print("[DONE ] renamed (OpenSubtitles exact match)")
+                        if args.dry_run:
+                            dryrun += 1
+                        else:
+                            renamed += 1
+                        renamed_opensubtitles += 1
+                        continue
 
         streams = ffprobe_subtitle_streams(mkv)
         if verbose:
@@ -1131,6 +1256,7 @@ def main():
     print(f"Dry-run renames:    {dryrun}")
     print(f"Errors:             {errors}")
     print(f"Evidence used: subtitles={used_subtitles} audio_primary={used_audio_primary} audio_fallback={used_audio_fallback}")
+    print(f"Renamed (OpenSubtitles exact):      {renamed_opensubtitles}")
     print(f"Skipped (TMDB verify failed):       {skipped_verify_failed}")
     print("Skipped:")
     print(f"  already named (SxxEyy):           {skipped_already_named}")
