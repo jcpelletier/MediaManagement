@@ -141,10 +141,13 @@ def opensubtitles_exact_match(
     show: str,
     season: int,
     timeout_s: float = 10.0,
+    verbose: bool = False,
 ) -> Optional[Tuple[int, str]]:
     moviehash = compute_opensubtitles_hash(mkv_path)
     if not moviehash:
         return None
+    if verbose:
+        print(f"[OSDB ] hash {moviehash}")
 
     headers = {
         "Api-Key": api_key,
@@ -160,6 +163,8 @@ def opensubtitles_exact_match(
     r = requests.get(OPENSUBTITLES_API_URL, headers=headers, params=params, timeout=timeout_s)
     r.raise_for_status()
     data = r.json().get("data") or []
+    if verbose:
+        print(f"[OSDB ] results returned: {len(data)}")
 
     show_norm = norm_title(show)
     for item in data:
@@ -169,6 +174,11 @@ def opensubtitles_exact_match(
         season_num = details.get("season_number")
         ep_num = details.get("episode_number")
         ep_title = details.get("title") or details.get("feature_title") or ""
+        if verbose:
+            print(
+                "[OSDB ] candidate "
+                f"parent_title=\"{parent_title}\" season={season_num} episode={ep_num}"
+            )
 
         if not isinstance(season_num, int) or not isinstance(ep_num, int):
             continue
@@ -917,6 +927,7 @@ def main():
                         mkv_path=mkv,
                         show=show,
                         season=season,
+                        verbose=verbose,
                     )
                 except Exception as e:
                     errors += 1
