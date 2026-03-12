@@ -21,7 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-import requests
+import anthropic
+from pydantic import BaseModel
 
 
 DEFAULT_EXTENSIONS = [
@@ -61,47 +62,36 @@ def format_files_for_prompt(files: List[Path]) -> str:
     return "\n".join(lines)
 
 
-def call_openai(folder_name: str, files_summary: str, api_key: str) -> Optional[FolderGuess]:
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+def call_claude(folder_name: str, files_summary: str, api_key: str) -> Optional[FolderGuess]:
+    class _MovieGuess(BaseModel):
+        title: str
+        year: Optional[int] = None
+        confidence: float
+
+    client = anthropic.Anthropic(api_key=api_key)
     system_prompt = (
         "You are a movie identifier. Given a folder name and contained video files, "
-        "return the most likely movie title and optional year. Respond ONLY with JSON "
-        "using keys: title (string), year (integer or null), confidence (0-1). If unsure, "
+        "return the most likely movie title and optional year. If unsure, "
         "set an empty title and confidence 0."
     )
     user_prompt = f"Folder: {folder_name}\nFiles:\n{files_summary}"
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-    }
-
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"ERROR: OpenAI request failed for '{folder_name}': {exc}")
+        response = client.messages.parse(
+            model="claude-opus-4-6",
+            max_tokens=256,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            output_format=_MovieGuess,
+        )
+    except anthropic.APIError as exc:
+        print(f"ERROR: Anthropic request failed for '{folder_name}': {exc}")
         return None
 
-    try:
-        content = response.json()["choices"][0]["message"]["content"]
-        data = json.loads(content)
-    except Exception as exc:  # noqa: BLE001
-        print(f"ERROR: Could not parse OpenAI response for '{folder_name}': {exc}")
-        return None
-
-    title = (data.get("title") or "").strip()
-    year = data.get("year")
-    confidence = float(data.get("confidence") or 0)
+    data = response.parsed_output
+    title = (data.title or "").strip()
+    year = data.year
+    confidence = float(data.confidence or 0)
 
     if year is not None:
         try:
@@ -189,7 +179,7 @@ def process_folder(folder: Path, extensions: List[str], api_key: str, min_confid
     largest_file = max(video_files, key=lambda p: p.stat().st_size)
     files_summary = format_files_for_prompt(video_files)
 
-    guess = call_openai(folder.name, files_summary, api_key)
+    guess = call_claude(folder.name, files_summary, api_key)
     if not guess:
         return
 
@@ -203,7 +193,7 @@ def process_folder(folder: Path, extensions: List[str], api_key: str, min_confid
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Rename and move ripped movies using OpenAI title guesses.")
+    parser = argparse.ArgumentParser(description="Rename and move ripped movies using Claude title guesses.")
     parser.add_argument(
         "--source",
         type=Path,
@@ -247,9 +237,9 @@ def main() -> None:
     args = parse_args()
 
     try:
-        api_key = os.environ["OPENAI_API_KEY"]
+        api_key = os.environ["ANTHROPIC_API_KEY"]
     except KeyError:
-        print("ERROR: OPENAI_API_KEY environment variable is not set.")
+        print("ERROR: ANTHROPIC_API_KEY environment variable is not set.")
         sys.exit(2)
 
     source_root: Path = args.source

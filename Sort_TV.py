@@ -12,9 +12,11 @@ Path 2 (LLM-assisted) + API verification:
 
 Requires:
 - ffprobe / ffmpeg on PATH (FFmpeg)
-- openai python package
+- anthropic python package (pip install anthropic)
+- openai python package (pip install openai) — only for audio transcription (Whisper)
 - requests
-- OPENAI_API_KEY env var set
+- ANTHROPIC_API_KEY env var set
+- OPENAI_API_KEY env var set (only required when --audio-fallback is enabled)
 - TMDB_API_KEY env var set (or pass --tmdb-api-key)
 
 TMDB endpoints used:
@@ -34,8 +36,10 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Any
 
+import anthropic
 import requests
 from openai import OpenAI
+from pydantic import BaseModel
 
 
 # ----------------------------
@@ -387,47 +391,32 @@ def transcribe_audio_whisper(client: OpenAI, wav_path: Path) -> Optional[str]:
 # Parsing show/season from folder
 # ----------------------------
 
-def parse_show_and_season_with_llm(client: OpenAI, folder_name: str) -> Tuple[Optional[str], Optional[int]]:
-    json_schema_object = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "show": {"type": ["string", "null"]},
-            "season": {"type": ["integer", "null"], "minimum": 1},
-        },
-        "required": ["show", "season"],
-    }
+def parse_show_and_season_with_llm(client: anthropic.Anthropic, folder_name: str) -> Tuple[Optional[str], Optional[int]]:
+    class _ShowSeason(BaseModel):
+        show: Optional[str] = None
+        season: Optional[int] = None
 
-    resp = client.responses.create(
-        model="gpt-5-mini",
-        input=[
-            {
-                "role": "system",
-                "content": "Return only the structured JSON object that matches the schema.",
-            },
-            {
+    try:
+        resp = client.messages.parse(
+            model="claude-opus-4-6",
+            max_tokens=256,
+            system="Return only the structured JSON object that matches the schema.",
+            messages=[{
                 "role": "user",
                 "content": (
                     "Extract the show name and season number from this folder name. "
                     "Return only the JSON object.\n\n"
                     f"Folder name: {folder_name}"
                 ),
-            },
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "show_season_parse",
-                "schema": json_schema_object,
-                "strict": True,
-            }
-        },
-    )
+            }],
+            output_format=_ShowSeason,
+        )
+    except Exception:
+        return None, None
 
-    raw = resp.output_text
-    result = json.loads(raw)
-    show = result.get("show")
-    season = result.get("season")
+    result = resp.parsed_output
+    show = result.show
+    season = result.season
 
     if isinstance(show, str):
         show = show.strip() or None
@@ -495,7 +484,7 @@ Evidence text:
 
 
 def call_llm_identify(
-    client: OpenAI,
+    client: anthropic.Anthropic,
     model: str,
     show: str,
     season: int,
@@ -503,49 +492,35 @@ def call_llm_identify(
     duration_minutes: float,
     evidence_kind: str
 ) -> dict:
-    json_schema_object = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "is_episode": {"type": "boolean"},
-            "show": {"type": "string"},
-            "season": {"type": "integer", "minimum": 1},
-            "episode_number": {"type": ["integer", "null"], "minimum": 1},
-            "episode_title": {"type": ["string", "null"]},
-            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-            "notes": {"type": "string"},
-        },
-        "required": [
-            "is_episode",
-            "show",
-            "season",
-            "episode_number",
-            "episode_title",
-            "confidence",
-            "notes",
-        ],
-    }
+    class _EpisodeID(BaseModel):
+        is_episode: bool
+        show: str
+        season: int
+        episode_number: Optional[int] = None
+        episode_title: Optional[str] = None
+        confidence: float
+        notes: str = ""
 
     prompt = build_prompt(show, season, evidence_text, duration_minutes, evidence_kind)
 
-    resp = client.responses.create(
+    resp = client.messages.parse(
         model=model,
-        input=[
-            {"role": "system", "content": "Return only the structured JSON result matching the schema."},
-            {"role": "user", "content": prompt},
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "episode_identification",
-                "schema": json_schema_object,
-                "strict": True,
-            }
-        },
+        max_tokens=1024,
+        system="Return only the structured JSON result matching the schema.",
+        messages=[{"role": "user", "content": prompt}],
+        output_format=_EpisodeID,
     )
 
-    raw = resp.output_text
-    return json.loads(raw)
+    result = resp.parsed_output
+    return {
+        "is_episode": result.is_episode,
+        "show": result.show,
+        "season": result.season,
+        "episode_number": result.episode_number,
+        "episode_title": result.episode_title,
+        "confidence": result.confidence,
+        "notes": result.notes,
+    }
 
 
 def format_llm_compact(result: dict, season: int, min_conf: float) -> Tuple[str, bool]:
@@ -765,7 +740,7 @@ def rename_in_place(src: Path, show: str, season: int, ep: int, title: str, dry_
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="Root folder containing season/disc folders (or a single folder).")
-    ap.add_argument("--model", default="gpt-5.2", help="OpenAI model name (default: gpt-5.2)")
+    ap.add_argument("--model", default="claude-opus-4-6", help="Anthropic model name (default: claude-opus-4-6)")
     ap.add_argument("--min-minutes", type=float, default=20.0, help="Skip files shorter than this (default: 20)")
     ap.add_argument("--max-minutes", type=float, default=60.0, help="Skip files longer than this (default: 60)")
     ap.add_argument("--min-confidence", type=float, default=0.85, help="Only consider LLM result when confidence >= this (default: 0.85)")
@@ -807,8 +782,8 @@ def main():
         if verbose:
             print(msg)
 
-    if verbose and not os.environ.get("OPENAI_API_KEY"):
-        vlog("[WARN ] OPENAI_API_KEY is not set. LLM + transcription calls will fail.\n")
+    if verbose and not os.environ.get("ANTHROPIC_API_KEY"):
+        vlog("[WARN ] ANTHROPIC_API_KEY is not set. LLM calls will fail.\n")
 
     verify_api_enabled = (not args.no_verify_api)
     tmdb_key = args.tmdb_api_key or os.environ.get("TMDB_API_KEY") or ""
@@ -821,7 +796,16 @@ def main():
         else:
             tmdb_client = TmdbClient(api_key=tmdb_key)
 
-    client = OpenAI()
+    anthropic_client = anthropic.Anthropic()
+
+    # OpenAI client used only for Whisper audio transcription
+    openai_client: Optional[OpenAI] = None
+    if audio_fallback_enabled:
+        if not os.environ.get("OPENAI_API_KEY"):
+            vlog("[WARN ] OPENAI_API_KEY is not set; audio transcription fallback disabled.\n")
+            audio_fallback_enabled = False
+        else:
+            openai_client = OpenAI()
 
     root = Path(args.root).expanduser().resolve()
     if not root.exists():
@@ -878,10 +862,10 @@ def main():
             continue
 
         folder = mkv.parent.name
-        vlog(f"[PARSE] GPT-5-mini parsing folder name: \"{folder}\"")
-        show, season = parse_show_and_season_with_llm(client, folder)
+        vlog(f"[PARSE] Claude parsing folder name: \"{folder}\"")
+        show, season = parse_show_and_season_with_llm(anthropic_client, folder)
         if not show or not season:
-            vlog("[PARSE] GPT-5-mini parse missing fields; falling back to regex parsing.")
+            vlog("[PARSE] Claude parse missing fields; falling back to regex parsing.")
             show, season = parse_show_and_season_from_folder(folder)
         if not show or not season:
             skipped_parse += 1
@@ -996,7 +980,7 @@ def main():
                         print(f"[ASR  ] {stage} transcript: FAILED (audio extraction)")
                     return None, None
                 try:
-                    tx = transcribe_audio_whisper(client, wav_path)
+                    tx = transcribe_audio_whisper(openai_client, wav_path)
                 except Exception as e:
                     if verbose:
                         print(f"[ERR  ] {stage} transcription failed: {e}")
@@ -1077,7 +1061,7 @@ def main():
         def attempt_llm_with_evidence(stage: str, e_text: str, e_kind: str) -> Tuple[bool, Optional[dict], str]:
             nonlocal errors
             try:
-                result = call_llm_identify(client, args.model, show, season, e_text, dur_m, e_kind)
+                result = call_llm_identify(anthropic_client, args.model, show, season, e_text, dur_m, e_kind)
             except Exception as e:
                 errors += 1
                 print(f"[ERR  ] LLM call failed ({stage}): {e}")
