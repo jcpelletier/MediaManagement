@@ -4,7 +4,7 @@ mkv_to_mp4.py
 
 Recursively converts all .mkv files under a given folder to .mp4 using ffmpeg:
 
-Video: H.264 (CRF 18, preset slow)
+Video: H.264 (NVENC hardware encoding, CQ 19, preset p4)
 Audio: AAC-LC, stereo, 48 kHz, 256 kbps (safer for Android & web)
 MP4:   +faststart for better streaming
 
@@ -46,9 +46,11 @@ def convert_file(ffmpeg_exe: str, mkv_path: Path, overwrite: bool, dry_run: bool
         ffmpeg_exe,
         "-y" if overwrite else "-n",
         "-i", str(mkv_path),
-        "-c:v", "libx264",
-        "-crf", "18",
-        "-preset", "slow",
+        "-c:v", "h264_nvenc",
+        "-rc:v", "vbr",
+        "-cq", "19",
+        "-preset", "p4",
+        "-b:v", "0",
         "-c:a", "aac",
         "-profile:a", "aac_low",
         "-ac", "2",
@@ -84,7 +86,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Recursively convert .mkv files to .mp4 with safer AAC audio for Android/web."
     )
-    parser.add_argument("folder", type=Path, help="Root folder to scan recursively for .mkv files.")
+    parser.add_argument("folder", type=Path, help="Root folder to scan recursively for i.mkv files.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing .mp4 files and delete MKVs after successful conversion.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be converted without running ffmpeg.")
     args = parser.parse_args()
