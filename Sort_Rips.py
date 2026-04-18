@@ -647,20 +647,27 @@ def main() -> None:
             print("      Run: pip install faster-whisper")
             whisper_enabled = False
         else:
-            compute_types = ["float16", "int8"] if args.whisper_device == "cuda" else ["int8"]
+            # Try CUDA compute types first; if all fail (e.g. GPU unavailable in container)
+            # fall back to CPU int8 which always works.
+            if args.whisper_device == "cuda":
+                candidates = [("cuda", "float16"), ("cuda", "int8"), ("cpu", "int8")]
+            else:
+                candidates = [("cpu", "int8")]
             print(f"Loading Whisper model '{args.whisper_model}' on {args.whisper_device}...")
-            for compute_type in compute_types:
+            for device, compute_type in candidates:
                 try:
                     whisper_model = _WhisperModel(
                         args.whisper_model,
-                        device=args.whisper_device,
+                        device=device,
                         compute_type=compute_type,
                     )
-                    print(f"Whisper model loaded (compute_type={compute_type}).")
+                    print(f"Whisper model loaded (device={device}, compute_type={compute_type}).")
                     break
                 except Exception as e:
-                    if compute_type != compute_types[-1]:
-                        print(f"  {compute_type} not supported, retrying with {compute_types[compute_types.index(compute_type)+1]}...")
+                    next_idx = candidates.index((device, compute_type)) + 1
+                    if next_idx < len(candidates):
+                        nd, nc = candidates[next_idx]
+                        print(f"  {device}/{compute_type} not available, retrying with {nd}/{nc}...")
                     else:
                         print(f"WARN: Failed to load Whisper model: {e}")
                         print("      Audio fallback disabled.")

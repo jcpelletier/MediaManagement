@@ -877,20 +877,27 @@ def main():
             vlog("        Run: pip install faster-whisper\n")
             audio_fallback_enabled = False
         else:
-            compute_types = ["float16", "int8"] if args.whisper_device == "cuda" else ["int8"]
+            # Try CUDA compute types first; if all fail (e.g. GPU unavailable in container)
+            # fall back to CPU int8 which always works.
+            if args.whisper_device == "cuda":
+                candidates = [("cuda", "float16"), ("cuda", "int8"), ("cpu", "int8")]
+            else:
+                candidates = [("cpu", "int8")]
             vlog(f"[INFO ] Loading Whisper model '{args.whisper_model}' on {args.whisper_device}...")
-            for compute_type in compute_types:
+            for device, compute_type in candidates:
                 try:
                     whisper_model = _FasterWhisperModel(
                         args.whisper_model,
-                        device=args.whisper_device,
+                        device=device,
                         compute_type=compute_type,
                     )
-                    vlog(f"[INFO ] Whisper model loaded (compute_type={compute_type}).\n")
+                    vlog(f"[INFO ] Whisper model loaded (device={device}, compute_type={compute_type}).\n")
                     break
                 except Exception as e:
-                    if compute_type != compute_types[-1]:
-                        vlog(f"[INFO ] {compute_type} not supported, retrying with {compute_types[compute_types.index(compute_type)+1]}...\n")
+                    next_idx = candidates.index((device, compute_type)) + 1
+                    if next_idx < len(candidates):
+                        nd, nc = candidates[next_idx]
+                        vlog(f"[INFO ] {device}/{compute_type} not available, retrying with {nd}/{nc}...\n")
                     else:
                         vlog(f"[WARN ] Failed to load Whisper model: {e}; audio fallback disabled.\n")
                         audio_fallback_enabled = False
