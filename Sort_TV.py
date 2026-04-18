@@ -13,7 +13,7 @@ Path 2 (LLM-assisted) + API verification:
 Requires:
 - ffprobe / ffmpeg on PATH (FFmpeg)
 - anthropic python package (pip install anthropic)
-- openai python package (pip install openai) — only for audio transcription (Whisper)
+- faster-whisper python package (pip install faster-whisper) — only for audio transcription fallback
 - requests
 - ANTHROPIC_API_KEY env var set
 - OPENAI_API_KEY env var set (only required when --audio-fallback is enabled)
@@ -38,7 +38,12 @@ from typing import Optional, Tuple, Dict, List, Any
 
 import anthropic
 import requests
-from openai import OpenAI
+try:
+    from faster_whisper import WhisperModel as _FasterWhisperModel
+    _FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    _FasterWhisperModel = None
+    _FASTER_WHISPER_AVAILABLE = False
 from pydantic import BaseModel
 
 
@@ -374,16 +379,9 @@ def extract_audio_clip_wav(
     return rc == 0 and out_wav.exists() and out_wav.stat().st_size > 0
 
 
-def transcribe_audio_whisper(client: OpenAI, wav_path: Path) -> Optional[str]:
-    with wav_path.open("rb") as f:
-        resp = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f
-        )
-    text = getattr(resp, "text", None)
-    if not text:
-        return None
-    text = text.strip()
+def transcribe_with_faster_whisper(model: "_FasterWhisperModel", wav_path: Path) -> Optional[str]:
+    segments, _ = model.transcribe(str(wav_path), beam_size=5)
+    text = " ".join(seg.text for seg in segments).strip()
     return text if text else None
 
 
@@ -809,7 +807,7 @@ def rename_in_place(src: Path, show: str, season: int, ep: int, title: str, dry_
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="Root folder containing season/disc folders (or a single folder).")
-    ap.add_argument("--model", default="claude-opus-4-6", help="Anthropic model name (default: claude-opus-4-6)")
+    ap.add_argument("--model", default="claude-sonnet-4-5", help="Anthropic model name (default: claude-sonnet-4-5)")
     ap.add_argument("--min-minutes", type=float, default=20.0, help="Skip files shorter than this (default: 20)")
     ap.add_argument("--max-minutes", type=float, default=60.0, help="Skip files longer than this (default: 60)")
     ap.add_argument("--min-confidence", type=float, default=0.85, help="Only consider LLM result when confidence >= this (default: 0.85)")
@@ -825,6 +823,10 @@ def main():
                     help="Primary audio start offset in seconds (default: 120).")
     ap.add_argument("--audio-seconds", type=float, default=DEFAULT_FALLBACK_AUDIO_SECONDS,
                     help="Fallback audio clip length in seconds (default: 300). Primary is always 120s.")
+    ap.add_argument("--whisper-model", default="base",
+                    help="faster-whisper model size (default: base). Options: tiny, base, small, medium, large-v3.")
+    ap.add_argument("--whisper-device", default="cpu",
+                    help="Device for faster-whisper (default: cpu). Use 'cuda' if GPU is available.")
 
     # OpenSubtitles knowledge boost
     ap.add_argument("--opensubtitles-exact-rename", action="store_true",
@@ -867,14 +869,25 @@ def main():
 
     anthropic_client = anthropic.Anthropic()
 
-    # OpenAI client used only for Whisper audio transcription
-    openai_client: Optional[OpenAI] = None
+    # Local faster-whisper model for audio transcription fallback
+    whisper_model = None
     if audio_fallback_enabled:
-        if not os.environ.get("OPENAI_API_KEY"):
-            vlog("[WARN ] OPENAI_API_KEY is not set; audio transcription fallback disabled.\n")
+        if not _FASTER_WHISPER_AVAILABLE:
+            vlog("[WARN ] faster-whisper not installed; audio transcription fallback disabled.\n")
+            vlog("        Run: pip install faster-whisper\n")
             audio_fallback_enabled = False
         else:
-            openai_client = OpenAI()
+            compute_type = "float16" if args.whisper_device == "cuda" else "int8"
+            vlog(f"[INFO ] Loading Whisper model '{args.whisper_model}' on {args.whisper_device}...")
+            try:
+                whisper_model = _FasterWhisperModel(
+                    args.whisper_model,
+                    device=args.whisper_device,
+                    compute_type=compute_type,
+                )
+            except Exception as e:
+                vlog(f"[WARN ] Failed to load Whisper model: {e}; audio fallback disabled.\n")
+                audio_fallback_enabled = False
 
     root = Path(args.root).expanduser().resolve()
     if not root.exists():
@@ -1054,7 +1067,7 @@ def main():
                         print(f"[ASR  ] {stage} transcript: FAILED (audio extraction)")
                     return None, None
                 try:
-                    tx = transcribe_audio_whisper(openai_client, wav_path)
+                    tx = transcribe_with_faster_whisper(whisper_model, wav_path)
                 except Exception as e:
                     if verbose:
                         print(f"[ERR  ] {stage} transcription failed: {e}")
