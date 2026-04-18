@@ -331,13 +331,22 @@ def extract_subtitle_excerpt(
             line = re.sub(r"^\(.*?\)\s*", "", line)
             if line:
                 lines.append(line)
-            if len(lines) >= max_lines:
-                break
 
         if not lines:
             return None
 
-        excerpt = "\n".join(lines)[:max_chars].strip()
+        # Sample from three positions so opening titles/recaps don't dominate.
+        # Each section gets max_lines//3 lines from: beginning, 25% in, 50% in.
+        n = len(lines)
+        per_section = max(1, max_lines // 3)
+        sections = []
+        for label, start_frac in [("BEGINNING", 0.0), ("QUARTER", 0.25), ("MIDDLE", 0.50)]:
+            start = int(n * start_frac)
+            chunk = lines[start : start + per_section]
+            if chunk:
+                sections.append(f"[{label}]\n" + "\n".join(chunk))
+
+        excerpt = "\n\n".join(sections)[:max_chars].strip()
         return excerpt if excerpt else None
 
 
@@ -823,8 +832,8 @@ def main():
                     help="Primary audio start offset in seconds (default: 120).")
     ap.add_argument("--audio-seconds", type=float, default=DEFAULT_FALLBACK_AUDIO_SECONDS,
                     help="Fallback audio clip length in seconds (default: 300). Primary is always 120s.")
-    ap.add_argument("--whisper-model", default="base",
-                    help="faster-whisper model size (default: base). Options: tiny, base, small, medium, large-v3.")
+    ap.add_argument("--whisper-model", default="small",
+                    help="faster-whisper model size (default: small). Options: tiny, base, small, medium, large-v3.")
     ap.add_argument("--whisper-device", default="cpu",
                     help="Device for faster-whisper (default: cpu). Use 'cuda' if GPU is available.")
 
@@ -941,10 +950,14 @@ def main():
     skipped_target_exists = 0
     skipped_verify_failed = 0
     renamed_opensubtitles = 0
+    skipped_conflict = 0
 
     used_subtitles = 0
     used_audio_primary = 0
     used_audio_fallback = 0
+
+    # Track which (show, season, episode) have been claimed this run to detect duplicates.
+    episode_claims: Dict[Tuple, Path] = {}
 
     for mkv in mkvs:
         total += 1
@@ -1219,6 +1232,16 @@ def main():
                 final_ep_num = vres.episode_number
                 final_title = vres.episode_title
 
+            # Duplicate detection: if another file this run already claimed this episode,
+            # return "conflict" so the caller can retry with audio evidence instead.
+            claim_key = (show.lower() if show else "", season or 0, final_ep_num)
+            if claim_key in episode_claims:
+                if verbose:
+                    print(f"[WARN ] S{season:02d}E{final_ep_num:02d} already claimed by "
+                          f"{episode_claims[claim_key].name} — forcing audio retry")
+                return False, result, "conflict"
+            episode_claims[claim_key] = mkv
+
             ok = rename_in_place(mkv, show, season, final_ep_num, final_title, args.dry_run)
             if ok:
                 return True, result, "renamed"
@@ -1310,6 +1333,15 @@ def main():
                     if verbose:
                         print("[WARN ] Blind identification without TMDB verification — accuracy not guaranteed.")
 
+                # Duplicate detection for blind mode
+                claim_key = (final_show.lower(), final_season, final_ep_num)
+                if claim_key in episode_claims:
+                    if verbose:
+                        print(f"[WARN ] {final_show} S{final_season:02d}E{final_ep_num:02d} already claimed by "
+                              f"{episode_claims[claim_key].name} — forcing audio retry")
+                    return False, result, "conflict"
+                episode_claims[claim_key] = mkv
+
                 ok = rename_in_place(mkv, final_show, final_season, final_ep_num, final_title, args.dry_run)
                 if ok:
                     if not args.dry_run:
@@ -1326,6 +1358,27 @@ def main():
             else:
                 renamed += 1
             continue
+
+        # Conflict: subtitle identified an already-claimed episode — retry with audio
+        if fail_code == "conflict" and audio_fallback_enabled and whisper_model is not None:
+            if verbose:
+                print("[RETRY] Duplicate episode from subtitles — forcing audio identification")
+            audio_tx, audio_start = attempt_audio_transcribe(PRIMARY_AUDIO_SECONDS, "CONFLICT-AUDIO", primary_start)
+            if audio_tx:
+                used_audio_primary += 1
+                conflict_kind = f"audio transcript (Whisper, conflict-retry {PRIMARY_AUDIO_SECONDS:.0f}s @ {audio_start:.0f}s)"
+                renamed_ok, first_result, fail_code = attempt_llm_with_evidence("CONFLICT-AUDIO", audio_tx, conflict_kind)
+                if renamed_ok:
+                    print("[DONE ] renamed (after conflict audio retry)")
+                    if args.dry_run:
+                        dryrun += 1
+                    else:
+                        renamed += 1
+                    continue
+            else:
+                if verbose:
+                    print("[RETRY] Audio unavailable for conflict retry")
+                fail_code = "conflict"
 
         used_primary_audio = (audio_transcript_primary is not None) and (evidence_text == audio_transcript_primary)
         if used_primary_audio and audio_fallback_enabled:
@@ -1415,6 +1468,11 @@ def main():
         if fail_code in ("llm_error", "verify_error"):
             continue
 
+        if fail_code == "conflict":
+            skipped_conflict += 1
+            print("[SKIP ] duplicate episode — audio retry could not resolve conflict")
+            continue
+
         if fail_code == "non_episode":
             skipped_non_episode += 1
             print("[SKIP ] LLM says non-episode/unknown")
@@ -1455,7 +1513,8 @@ def main():
     print(f"  duration out of range:            {skipped_duration_range}")
     print(f"  no usable evidence text:          {skipped_no_evidence}")
     print(f"  LLM says non-episode:             {skipped_non_episode}")
-    print(f"  confidence below threshold:       {skipped_low_conf}")
+    print(f"  confidence below threshold:       {skipped_low_conf}
+  duplicate episode (conflict):     {skipped_conflict}")
     print(f"  missing episode number/title:     {skipped_missing_fields}")
     print(f"  target exists/other:              {skipped_target_exists}")
 
