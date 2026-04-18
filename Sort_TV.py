@@ -1513,8 +1513,8 @@ def main():
     print(f"  duration out of range:            {skipped_duration_range}")
     print(f"  no usable evidence text:          {skipped_no_evidence}")
     print(f"  LLM says non-episode:             {skipped_non_episode}")
-    print(f"  confidence below threshold:       {skipped_low_conf}
-  duplicate episode (conflict):     {skipped_conflict}")
+    print(f"  confidence below threshold:       {skipped_low_conf}")
+    print(f"  duplicate episode (conflict):     {skipped_conflict}")
     print(f"  missing episode number/title:     {skipped_missing_fields}")
     print(f"  target exists/other:              {skipped_target_exists}")
 
