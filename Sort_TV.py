@@ -877,17 +877,23 @@ def main():
             vlog("        Run: pip install faster-whisper\n")
             audio_fallback_enabled = False
         else:
-            compute_type = "float16" if args.whisper_device == "cuda" else "int8"
+            compute_types = ["float16", "int8"] if args.whisper_device == "cuda" else ["int8"]
             vlog(f"[INFO ] Loading Whisper model '{args.whisper_model}' on {args.whisper_device}...")
-            try:
-                whisper_model = _FasterWhisperModel(
-                    args.whisper_model,
-                    device=args.whisper_device,
-                    compute_type=compute_type,
-                )
-            except Exception as e:
-                vlog(f"[WARN ] Failed to load Whisper model: {e}; audio fallback disabled.\n")
-                audio_fallback_enabled = False
+            for compute_type in compute_types:
+                try:
+                    whisper_model = _FasterWhisperModel(
+                        args.whisper_model,
+                        device=args.whisper_device,
+                        compute_type=compute_type,
+                    )
+                    vlog(f"[INFO ] Whisper model loaded (compute_type={compute_type}).\n")
+                    break
+                except Exception as e:
+                    if compute_type != compute_types[-1]:
+                        vlog(f"[INFO ] {compute_type} not supported, retrying with {compute_types[compute_types.index(compute_type)+1]}...\n")
+                    else:
+                        vlog(f"[WARN ] Failed to load Whisper model: {e}; audio fallback disabled.\n")
+                        audio_fallback_enabled = False
 
     root = Path(args.root).expanduser().resolve()
     if not root.exists():

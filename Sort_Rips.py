@@ -647,19 +647,24 @@ def main() -> None:
             print("      Run: pip install faster-whisper")
             whisper_enabled = False
         else:
-            compute_type = "float16" if args.whisper_device == "cuda" else "int8"
+            compute_types = ["float16", "int8"] if args.whisper_device == "cuda" else ["int8"]
             print(f"Loading Whisper model '{args.whisper_model}' on {args.whisper_device}...")
-            try:
-                whisper_model = _WhisperModel(
-                    args.whisper_model,
-                    device=args.whisper_device,
-                    compute_type=compute_type,
-                )
-                print("Whisper model loaded.")
-            except Exception as e:
-                print(f"WARN: Failed to load Whisper model: {e}")
-                print("      Audio fallback disabled.")
-                whisper_enabled = False
+            for compute_type in compute_types:
+                try:
+                    whisper_model = _WhisperModel(
+                        args.whisper_model,
+                        device=args.whisper_device,
+                        compute_type=compute_type,
+                    )
+                    print(f"Whisper model loaded (compute_type={compute_type}).")
+                    break
+                except Exception as e:
+                    if compute_type != compute_types[-1]:
+                        print(f"  {compute_type} not supported, retrying with {compute_types[compute_types.index(compute_type)+1]}...")
+                    else:
+                        print(f"WARN: Failed to load Whisper model: {e}")
+                        print("      Audio fallback disabled.")
+                        whisper_enabled = False
 
     # ── TMDB setup ────────────────────────────────────────────────────────────
     tmdb_client = None
