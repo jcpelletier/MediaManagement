@@ -483,6 +483,36 @@ Evidence text:
 """
 
 
+def build_blind_prompt(evidence_text: str, duration_minutes: float, evidence_kind: str) -> str:
+    """Prompt used when no show/season hint is available from the folder name.
+    Claude must identify the show, season, and episode entirely from content."""
+    return f"""You are identifying TV episodes for file renaming.
+
+No folder name is available. Identify the show, season, and episode entirely from the evidence below.
+
+FILE INFO:
+- Duration: {duration_minutes:.1f} minutes
+- The file may be a NON-EPISODE extra (featurette, recap, deleted scenes). If so, mark is_episode=false.
+
+EVIDENCE TYPE:
+- {evidence_kind}
+
+TASK:
+Using ONLY the evidence text below, decide:
+- is_episode (true/false)
+- If is_episode=true: show name, season number (integer >= 1), episode_number (1-based integer within the season), and episode_title
+- confidence from 0.0 to 1.0
+
+Be conservative with confidence. Only return high confidence when the evidence clearly and unambiguously identifies the specific episode. If in doubt, return low confidence rather than guessing.
+Evidence may include multiple separate clips from the same file; they are not necessarily contiguous and should be treated as separate excerpts.
+
+Evidence text:
+\"\"\"
+{evidence_text}
+\"\"\"
+"""
+
+
 def call_llm_identify(
     client: anthropic.Anthropic,
     model: str,
@@ -509,6 +539,45 @@ def call_llm_identify(
         system="Return only the structured JSON result matching the schema.",
         messages=[{"role": "user", "content": prompt}],
         output_format=_EpisodeID,
+    )
+
+    result = resp.parsed_output
+    return {
+        "is_episode": result.is_episode,
+        "show": result.show,
+        "season": result.season,
+        "episode_number": result.episode_number,
+        "episode_title": result.episode_title,
+        "confidence": result.confidence,
+        "notes": result.notes,
+    }
+
+
+def call_llm_identify_blind(
+    client: anthropic.Anthropic,
+    model: str,
+    evidence_text: str,
+    duration_minutes: float,
+    evidence_kind: str,
+) -> dict:
+    """Blind identification — no show/season hints. Claude infers everything from content."""
+    class _EpisodeIDBlind(BaseModel):
+        is_episode: bool
+        show: Optional[str] = None
+        season: Optional[int] = None
+        episode_number: Optional[int] = None
+        episode_title: Optional[str] = None
+        confidence: float
+        notes: str = ""
+
+    prompt = build_blind_prompt(evidence_text, duration_minutes, evidence_kind)
+
+    resp = client.messages.parse(
+        model=model,
+        max_tokens=1024,
+        system="Return only the structured JSON result matching the schema.",
+        messages=[{"role": "user", "content": prompt}],
+        output_format=_EpisodeIDBlind,
     )
 
     result = resp.parsed_output
@@ -837,6 +906,7 @@ def main():
     skipped_already_named = 0
     skipped_parse = 0
     skipped_no_duration = 0
+    renamed_blind = 0
     skipped_duration_range = 0
     skipped_no_evidence = 0
     skipped_non_episode = 0
@@ -867,12 +937,12 @@ def main():
         if not show or not season:
             vlog("[PARSE] Claude parse missing fields; falling back to regex parsing.")
             show, season = parse_show_and_season_from_folder(folder)
-        if not show or not season:
-            skipped_parse += 1
-            print(f"[SKIP ] can't parse show/season from folder: \"{folder}\"")
-            continue
+        folder_parse_failed = not show or not season
+        if folder_parse_failed:
+            vlog(f"[PARSE] Folder \"{folder}\" yielded no show/season — will attempt blind identification from content.")
 
-        if tmdb_client is not None:
+        # TMDB show name canonicalization — only possible when folder gave us a show name
+        if not folder_parse_failed and tmdb_client is not None:
             try:
                 tmdb_show = tmdb_client.find_tv(show)
             except Exception as e:
@@ -891,14 +961,18 @@ def main():
             continue
 
         dur_m = dur_s / 60.0
-        print(f"HINT : {show} | S{season:02d} | {dur_m:.1f}m")
+        if show and season:
+            print(f"HINT : {show} | S{season:02d} | {dur_m:.1f}m")
+        else:
+            print(f"HINT : [blind] | {dur_m:.1f}m")
 
         if dur_m < args.min_minutes or dur_m > args.max_minutes:
             skipped_duration_range += 1
             print(f"[SKIP ] duration {dur_m:.1f}m out of range [{args.min_minutes:.1f}, {args.max_minutes:.1f}]")
             continue
 
-        if args.opensubtitles_exact_rename:
+        # OpenSubtitles exact hash rename requires a known show + season
+        if not folder_parse_failed and args.opensubtitles_exact_rename:
             api_key = os.environ.get("OPENSUB_API_KEY")
             if not api_key:
                 if verbose:
@@ -1124,10 +1198,103 @@ def main():
                 return True, result, "renamed"
             return False, result, "target_exists"
 
+        if folder_parse_failed:
+            # Blind mode: redefine attempt_llm_with_evidence to identify show+season+episode
+            # from content alone, with no folder-name hints.
+            def attempt_llm_with_evidence(stage: str, e_text: str, e_kind: str) -> Tuple[bool, Optional[dict], str]:  # noqa: F811
+                nonlocal errors, renamed_blind
+                try:
+                    result = call_llm_identify_blind(anthropic_client, args.model, e_text, dur_m, e_kind)
+                except Exception as e:
+                    errors += 1
+                    print(f"[ERR  ] Blind LLM call failed ({stage}): {e}")
+                    return False, None, "llm_error"
+
+                blind_show = (result.get("show") or "").strip()
+                blind_season = result.get("season")
+                ep_num = result.get("episode_number")
+                ep_title = result.get("episode_title")
+                conf = float(result.get("confidence", 0.0))
+                is_ep = bool(result.get("is_episode"))
+
+                if verbose:
+                    if is_ep and blind_show and isinstance(blind_season, int) and isinstance(ep_num, int) and ep_title:
+                        mark = "✓" if conf >= args.min_confidence else "✗"
+                        print(f"[LLM  ] {stage} (blind) -> {blind_show} S{blind_season:02d}E{ep_num:02d} \"{ep_title}\" (conf={conf:.2f}) {mark}")
+                    else:
+                        print(f"[LLM  ] {stage} (blind) -> non-episode/unknown (conf={conf:.2f}) ✗")
+                    notes = one_line(result.get("notes", ""), 140)
+                    if notes and conf < args.min_confidence:
+                        print(f"       reason: {notes}")
+
+                if not is_ep:
+                    return False, result, "non_episode"
+                if conf < args.min_confidence:
+                    return False, result, "low_conf"
+                if not blind_show or not isinstance(blind_season, int) or blind_season < 1 \
+                        or not isinstance(ep_num, int) or not ep_title:
+                    return False, result, "missing_fields"
+
+                final_show = blind_show
+                final_season = blind_season
+                final_ep_num = ep_num
+                final_title = ep_title
+
+                if verify_api_enabled and tmdb_client is not None:
+                    # Canonicalize show name first
+                    try:
+                        tmdb_show_result = tmdb_client.find_tv(blind_show)
+                    except Exception as e:
+                        errors += 1
+                        print(f"[ERR  ] TMDB show lookup (blind) failed: {e}")
+                        return False, result, "verify_error"
+                    if tmdb_show_result:
+                        if verbose and norm_title(tmdb_show_result.name) != norm_title(blind_show):
+                            print(f"[API  ] TMDB canonical show -> \"{tmdb_show_result.name}\"")
+                        final_show = tmdb_show_result.name
+
+                    # Verify episode
+                    try:
+                        vres = verify_or_correct_with_tmdb(
+                            tmdb=tmdb_client,
+                            show=final_show,
+                            season=blind_season,
+                            proposed_ep_num=ep_num,
+                            proposed_title=ep_title,
+                            min_title_match=float(args.tmdb_min_title_match),
+                        )
+                    except Exception as e:
+                        errors += 1
+                        print(f"[ERR  ] TMDB verify (blind) failed: {e}")
+                        return False, result, "verify_error"
+
+                    if verbose:
+                        if vres.ok:
+                            tag = "corrected" if vres.corrected else "confirmed"
+                            print(f"[API  ] TMDB {tag}  -> S{blind_season:02d}E{vres.episode_number:02d} \"{vres.episode_title}\" (match={vres.match_score:.2f})")
+                        else:
+                            print(f"[API  ] TMDB reject     -> {vres.reason}")
+
+                    if not vres.ok or vres.episode_number is None or not vres.episode_title:
+                        return False, result, "verify_failed"
+
+                    final_ep_num = vres.episode_number
+                    final_title = vres.episode_title
+                else:
+                    if verbose:
+                        print("[WARN ] Blind identification without TMDB verification — accuracy not guaranteed.")
+
+                ok = rename_in_place(mkv, final_show, final_season, final_ep_num, final_title, args.dry_run)
+                if ok:
+                    if not args.dry_run:
+                        renamed_blind += 1
+                    return True, result, "renamed"
+                return False, result, "target_exists"
+
         renamed_ok, first_result, fail_code = attempt_llm_with_evidence("PRIMARY", evidence_text, evidence_kind)
 
         if renamed_ok:
-            print("[DONE ] renamed")
+            print("[DONE ] renamed" + (" (blind)" if folder_parse_failed else ""))
             if args.dry_run:
                 dryrun += 1
             else:
@@ -1250,6 +1417,7 @@ def main():
     print("\n=== SUMMARY ===")
     print(f"Total files scanned: {total}")
     print(f"Renamed:            {renamed}")
+    print(f"  of which blind:   {renamed_blind}  (no folder hint — identified from content)")
     print(f"Dry-run renames:    {dryrun}")
     print(f"Errors:             {errors}")
     print(f"Evidence used: subtitles={used_subtitles} audio_primary={used_audio_primary} audio_fallback={used_audio_fallback}")
@@ -1257,7 +1425,6 @@ def main():
     print(f"Skipped (TMDB verify failed):       {skipped_verify_failed}")
     print("Skipped:")
     print(f"  already named (SxxEyy):           {skipped_already_named}")
-    print(f"  can't parse show/season:          {skipped_parse}")
     print(f"  no duration (ffprobe):            {skipped_no_duration}")
     print(f"  duration out of range:            {skipped_duration_range}")
     print(f"  no usable evidence text:          {skipped_no_evidence}")
