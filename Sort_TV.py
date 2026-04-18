@@ -51,12 +51,12 @@ from pydantic import BaseModel
 # Constants (fallback strategy)
 # ----------------------------
 
-PRIMARY_AUDIO_SECONDS = 120.0
+PRIMARY_AUDIO_SECONDS = 240.0
 
 # Shift audio sampling to 2 minutes in (120 seconds).
 AUDIO_START_SECONDS_HARDCODED = 120.0
 
-DEFAULT_FALLBACK_AUDIO_SECONDS = 300.0
+DEFAULT_FALLBACK_AUDIO_SECONDS = 600.0
 
 INVALID_FILENAME_CHARS = r'<>:"/\\|?*'
 
