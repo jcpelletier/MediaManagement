@@ -464,7 +464,27 @@ def parse_show_and_season_from_folder(folder_name: str) -> Tuple[Optional[str], 
 # LLM: identify episode
 # ----------------------------
 
-def build_prompt(show: str, season: int, evidence_text: str, duration_minutes: float, evidence_kind: str) -> str:
+def build_prompt(show: str, season: int, evidence_text: str, duration_minutes: float,
+                 evidence_kind: str, episode_guide: Optional[str] = None,
+                 disc_context: Optional[List[str]] = None) -> str:
+    guide_section = ""
+    if episode_guide:
+        guide_section = (
+            f"\n## Season {season} Episode Guide (from TMDB)\n"
+            f"Match the evidence against this list. Episodes flagged '<-- duration match' have a "
+            f"runtime within 12 minutes of this file's duration ({duration_minutes:.1f} min) "
+            f"and are the most likely candidates.\n"
+            f"{episode_guide}\n"
+        )
+
+    context_section = ""
+    if disc_context:
+        context_section = (
+            "\n## Already identified from this disc (earlier files in this folder)\n"
+            + "\n".join(f"  - {ep}" for ep in disc_context)
+            + "\nThese episodes are already taken — do not assign the same episode number to this file.\n"
+        )
+
     return f"""You are identifying TV episodes for file renaming.
 
 HINTS:
@@ -472,12 +492,12 @@ HINTS:
 - Season: {season}
 - File duration: {duration_minutes:.1f} minutes
 - The file may be a NON-EPISODE extra (featurette, recap, deleted scenes). If so, mark is_episode=false.
-
+{guide_section}{context_section}
 EVIDENCE TYPE:
 - {evidence_kind}
 
 TASK:
-Using ONLY the evidence text below, decide:
+Using the evidence text and the episode guide above (if provided), decide:
 - is_episode (true/false)
 - If is_episode=true: episode_number (1-based integer within the season) and episode_title
 - confidence from 0.0 to 1.0
@@ -527,7 +547,9 @@ def call_llm_identify(
     season: int,
     evidence_text: str,
     duration_minutes: float,
-    evidence_kind: str
+    evidence_kind: str,
+    episode_guide: Optional[str] = None,
+    disc_context: Optional[List[str]] = None,
 ) -> dict:
     class _EpisodeID(BaseModel):
         is_episode: bool
@@ -538,7 +560,8 @@ def call_llm_identify(
         confidence: float
         notes: str = ""
 
-    prompt = build_prompt(show, season, evidence_text, duration_minutes, evidence_kind)
+    prompt = build_prompt(show, season, evidence_text, duration_minutes, evidence_kind,
+                          episode_guide=episode_guide, disc_context=disc_context)
 
     resp = client.messages.parse(
         model=model,
@@ -626,6 +649,8 @@ def format_llm_compact(result: dict, season: int, min_conf: float) -> Tuple[str,
 class TmdbEpisode:
     episode_number: int
     name: str
+    runtime: Optional[int] = None   # minutes, may be None if TMDB lacks data
+    overview: str = ""              # plot synopsis
 
 
 @dataclass
@@ -694,9 +719,36 @@ class TmdbClient:
             num = e.get("episode_number")
             name = e.get("name")
             if isinstance(num, int) and name:
-                eps.append(TmdbEpisode(episode_number=num, name=str(name)))
+                eps.append(TmdbEpisode(
+                    episode_number=num,
+                    name=str(name),
+                    runtime=e.get("runtime") if isinstance(e.get("runtime"), int) else None,
+                    overview=str(e.get("overview") or ""),
+                ))
         self._season_cache[ck] = eps
         return eps
+
+
+def format_episode_guide(episodes: List[TmdbEpisode], season: int,
+                          file_duration_minutes: float,
+                          duration_tolerance_minutes: float = 12.0) -> str:
+    """
+    Format a season's episode list as a guide for the LLM.
+    Episodes whose runtime is within tolerance of the file duration are flagged.
+    """
+    lines = []
+    for ep in episodes:
+        parts = [f"S{season:02d}E{ep.episode_number:02d} \"{ep.name}\""]
+        if ep.runtime:
+            parts.append(f"({ep.runtime}min)")
+            if abs(ep.runtime - file_duration_minutes) <= duration_tolerance_minutes:
+                parts.append("<-- duration match")
+        else:
+            parts.append("(?min)")
+        if ep.overview:
+            parts.append(f"— {ep.overview[:150]}")
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
 
 
 @dataclass
@@ -959,6 +1011,14 @@ def main():
     # Track which (show, season, episode) have been claimed this run to detect duplicates.
     episode_claims: Dict[Tuple, Path] = {}
 
+    # Per-folder episode guide (fetched once from TMDB, keyed by (show, season)).
+    episode_guide_cache: Dict[Tuple, Optional[str]] = {}
+
+    # Per-folder disc context: episodes already identified from the current folder.
+    # Reset each time we move to a new parent folder.
+    _current_folder: Optional[str] = None
+    disc_context_list: List[str] = []
+
     for mkv in mkvs:
         total += 1
 
@@ -993,6 +1053,11 @@ def main():
                     print(f"[API  ] TMDB canonical show -> \"{tmdb_show.name}\"")
                 show = tmdb_show.name
 
+        # Reset disc context when we move to a new folder
+        if folder != _current_folder:
+            _current_folder = folder
+            disc_context_list = []
+
         dur_s = ffprobe_duration_seconds(mkv)
         if dur_s is None:
             skipped_no_duration += 1
@@ -1009,6 +1074,22 @@ def main():
             skipped_duration_range += 1
             print(f"[SKIP ] duration {dur_m:.1f}m out of range [{args.min_minutes:.1f}, {args.max_minutes:.1f}]")
             continue
+
+        # Fetch episode guide from TMDB (cached per show+season) for LLM context
+        episode_guide: Optional[str] = None
+        if not folder_parse_failed and tmdb_client is not None and show and season:
+            guide_key = (show.lower(), season)
+            if guide_key not in episode_guide_cache:
+                try:
+                    tv_id = tmdb_client.find_tv_id(show)
+                    if tv_id:
+                        eps = tmdb_client.get_season_episodes(tv_id, season)
+                        episode_guide_cache[guide_key] = format_episode_guide(eps, season, dur_m) if eps else None
+                    else:
+                        episode_guide_cache[guide_key] = None
+                except Exception:
+                    episode_guide_cache[guide_key] = None
+            episode_guide = episode_guide_cache.get(guide_key)
 
         # OpenSubtitles exact hash rename requires a known show + season
         if not folder_parse_failed and args.opensubtitles_exact_rename:
@@ -1174,7 +1255,11 @@ def main():
         def attempt_llm_with_evidence(stage: str, e_text: str, e_kind: str) -> Tuple[bool, Optional[dict], str]:
             nonlocal errors
             try:
-                result = call_llm_identify(anthropic_client, args.model, show, season, e_text, dur_m, e_kind)
+                result = call_llm_identify(
+                    anthropic_client, args.model, show, season, e_text, dur_m, e_kind,
+                    episode_guide=episode_guide,
+                    disc_context=list(disc_context_list) or None,
+                )
             except Exception as e:
                 errors += 1
                 print(f"[ERR  ] LLM call failed ({stage}): {e}")
@@ -1244,6 +1329,7 @@ def main():
 
             ok = rename_in_place(mkv, show, season, final_ep_num, final_title, args.dry_run)
             if ok:
+                disc_context_list.append(f"S{season:02d}E{final_ep_num:02d} \"{final_title}\"")
                 return True, result, "renamed"
             return False, result, "target_exists"
 
@@ -1344,6 +1430,7 @@ def main():
 
                 ok = rename_in_place(mkv, final_show, final_season, final_ep_num, final_title, args.dry_run)
                 if ok:
+                    disc_context_list.append(f"{final_show} S{final_season:02d}E{final_ep_num:02d} \"{final_title}\"")
                     if not args.dry_run:
                         renamed_blind += 1
                     return True, result, "renamed"
