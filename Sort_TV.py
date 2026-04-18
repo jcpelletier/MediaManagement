@@ -809,7 +809,7 @@ def main():
     ap.add_argument("--root", required=True, help="Root folder containing season/disc folders (or a single folder).")
     ap.add_argument("--model", default="claude-sonnet-4-5", help="Anthropic model name (default: claude-sonnet-4-5)")
     ap.add_argument("--min-minutes", type=float, default=7.0, help="Skip files shorter than this (default: 7)")
-    ap.add_argument("--max-minutes", type=float, default=60.0, help="Skip files longer than this (default: 60)")
+    ap.add_argument("--max-minutes", type=float, default=100.0, help="Skip files longer than this (default: 100)")
     ap.add_argument("--min-confidence", type=float, default=0.85, help="Only consider LLM result when confidence >= this (default: 0.85)")
     ap.add_argument("--max-sub-lines", type=int, default=80, help="Subtitle lines to include (default: 80)")
     ap.add_argument("--dry-run", action="store_true", help="Print planned renames, do not rename.")
