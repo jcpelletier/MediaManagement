@@ -405,7 +405,7 @@ def parse_show_and_season_with_llm(client: anthropic.Anthropic, folder_name: str
 
     try:
         resp = client.messages.parse(
-            model="claude-haiku-3-5",
+            model="claude-sonnet-4-5",
             max_tokens=256,
             system="Return only the structured JSON object that matches the schema.",
             messages=[{
