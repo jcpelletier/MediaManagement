@@ -949,6 +949,8 @@ def main():
                     help="TMDB API key (or set TMDB_API_KEY env var).")
     ap.add_argument("--tmdb-min-title-match", type=float, default=0.78,
                     help="Minimum title similarity (0-1) to confirm/correct using TMDB (default: 0.78).")
+    ap.add_argument("--summary-json", default=None,
+                    help="Write a JSON run summary to this path for post-build notifications.")
     args = ap.parse_args()
 
     dest_root: Optional[Path] = Path(args.dest).expanduser().resolve() if args.dest else None
@@ -1053,6 +1055,10 @@ def main():
     skipped_verify_failed = 0
     renamed_opensubtitles = 0
     skipped_conflict = 0
+
+    # For summary notification
+    renamed_episodes: List[str] = []   # "Show - SxxEyy - Title" per successful rename/move
+    skipped_files: List[dict] = []     # {"file": str, "reason": str} per actionable skip
 
     used_subtitles = 0
     used_audio_primary = 0
@@ -1380,6 +1386,7 @@ def main():
             ok = rename_and_move(mkv, show, season, final_ep_num, final_title, args.dry_run, dest_root)
             if ok:
                 disc_context_list.append(f"S{season:02d}E{final_ep_num:02d} \"{final_title}\"")
+                renamed_episodes.append(f"{sanitize_filename(show)} - S{season:02d}E{final_ep_num:02d} - {sanitize_filename(final_title)}")
                 return True, result, "renamed"
             return False, result, "target_exists"
 
@@ -1481,6 +1488,7 @@ def main():
                 ok = rename_and_move(mkv, final_show, final_season, final_ep_num, final_title, args.dry_run, dest_root)
                 if ok:
                     disc_context_list.append(f"{final_show} S{final_season:02d}E{final_ep_num:02d} \"{final_title}\"")
+                    renamed_episodes.append(f"{sanitize_filename(final_show)} - S{final_season:02d}E{final_ep_num:02d} - {sanitize_filename(final_title)}")
                     if not args.dry_run:
                         renamed_blind += 1
                     return True, result, "renamed"
@@ -1608,27 +1616,32 @@ def main():
         if fail_code == "conflict":
             skipped_conflict += 1
             print("[SKIP ] duplicate episode — audio retry could not resolve conflict")
+            skipped_files.append({"file": mkv.name, "reason": "duplicate episode — conflict unresolved"})
             continue
 
         if fail_code == "non_episode":
             skipped_non_episode += 1
             print("[SKIP ] LLM says non-episode/unknown")
+            skipped_files.append({"file": mkv.name, "reason": "identified as non-episode (featurette/extra)"})
             continue
 
         if fail_code == "low_conf":
             skipped_low_conf += 1
             conf = float((first_result or {}).get("confidence", 0.0))
             print(f"[SKIP ] confidence {conf:.2f} < {args.min_confidence:.2f}")
+            skipped_files.append({"file": mkv.name, "reason": f"low confidence ({conf:.2f})"})
             continue
 
         if fail_code == "missing_fields":
             skipped_missing_fields += 1
             print("[SKIP ] missing episode_number or episode_title")
+            skipped_files.append({"file": mkv.name, "reason": "LLM returned incomplete result"})
             continue
 
         if fail_code == "verify_failed":
             skipped_verify_failed += 1
             print("[SKIP ] TMDB could not confirm episode number/title (preventing bad rename)")
+            skipped_files.append({"file": mkv.name, "reason": "TMDB could not verify episode"})
             continue
 
         skipped_target_exists += 1
@@ -1654,6 +1667,20 @@ def main():
     print(f"  duplicate episode (conflict):     {skipped_conflict}")
     print(f"  missing episode number/title:     {skipped_missing_fields}")
     print(f"  target exists/other:              {skipped_target_exists}")
+
+    if args.summary_json:
+        summary = {
+            "total": total,
+            "renamed": renamed + dryrun,
+            "dry_run": args.dry_run,
+            "skipped_count": len(skipped_files),
+            "renamed_episodes": renamed_episodes,
+            "skipped_files": skipped_files,
+        }
+        try:
+            Path(args.summary_json).write_text(json.dumps(summary, indent=2))
+        except Exception as e:
+            print(f"[WARN ] Could not write summary JSON: {e}")
 
 
 if __name__ == "__main__":
