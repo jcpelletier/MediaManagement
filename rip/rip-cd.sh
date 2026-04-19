@@ -25,13 +25,19 @@ if [ $STATUS -eq 0 ]; then
     TRACK_COUNT=$(find "$ALBUM_DIR" -name "*.flac" | wc -l)
     echo "[$(date)] Rip completed: $ARTIST / $ALBUM ($TRACK_COUNT tracks)" >> "$LOG"
     ai_event "rip-cd" "RipCompleted" "drive=$DRIVE" "artist=$ARTIST" "album=$ALBUM" "track_count=$TRACK_COUNT"
+    /opt/discord-bot/notify-discord.sh "rip-cd" "SUCCESS" "0" "" \
+      "🎵 Ripped **$ARTIST / $ALBUM** ($TRACK_COUNT track(s))"
   else
     echo "[$(date)] Rip completed (output directory not found)" >> "$LOG"
     ai_event "rip-cd" "RipCompleted" "drive=$DRIVE"
+    /opt/discord-bot/notify-discord.sh "rip-cd" "SUCCESS" "0" "" \
+      "🎵 CD rip completed (album directory not found)"
   fi
 else
   echo "[$(date)] ERROR: Rip failed with exit status $STATUS" >> "$LOG"
   ai_trace "rip-cd" "Error" "CD rip failed" "drive=$DRIVE" "exit_status=$STATUS"
+  /opt/discord-bot/notify-discord.sh "rip-cd" "FAILURE" "0" "" \
+    "❌ CD rip failed (exit status $STATUS)"
 fi
 
 rm -f "$TIMESTAMP_REF"
