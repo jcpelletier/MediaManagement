@@ -1058,7 +1058,9 @@ def main():
 
     # For summary notification
     renamed_episodes: List[str] = []   # "Show - SxxEyy - Title" per successful rename/move
-    skipped_files: List[dict] = []     # {"file": str, "reason": str} per actionable skip
+    skipped_files: List[dict] = []     # {"file": str, "reason": str} per truly unresolvable skip
+    extras_queue: List[Tuple[Path, str, int]] = []  # (path, show, season) — unidentified files to move to Extras
+    extras_moved: List[str] = []       # "Show - S01 - Extra_N.mkv" per file moved to Extras
 
     used_subtitles = 0
     used_audio_primary = 0
@@ -1129,6 +1131,8 @@ def main():
         if dur_m < args.min_minutes or dur_m > args.max_minutes:
             skipped_duration_range += 1
             print(f"[SKIP ] duration {dur_m:.1f}m out of range [{args.min_minutes:.1f}, {args.max_minutes:.1f}]")
+            if dest_root and show and season:
+                extras_queue.append((mkv, show, season))
             continue
 
         # Fetch episode guide from TMDB (cached per show+season) for LLM context
@@ -1303,6 +1307,8 @@ def main():
         if evidence_text is None:
             skipped_no_evidence += 1
             print("[SKIP ] no usable evidence text (subtitles unavailable and transcription failed/disabled)")
+            if dest_root and show and season:
+                extras_queue.append((mkv, show, season))
             continue
 
         if verbose:
@@ -1613,35 +1619,42 @@ def main():
         if fail_code in ("llm_error", "verify_error"):
             continue
 
+        def _queue_or_skip(reason: str) -> None:
+            """Add to extras_queue when dest+context available, else skipped_files."""
+            if dest_root and show and season:
+                extras_queue.append((mkv, show, season))
+            else:
+                skipped_files.append({"file": mkv.name, "reason": reason})
+
         if fail_code == "conflict":
             skipped_conflict += 1
             print("[SKIP ] duplicate episode — audio retry could not resolve conflict")
-            skipped_files.append({"file": mkv.name, "reason": "duplicate episode — conflict unresolved"})
+            _queue_or_skip("duplicate episode — conflict unresolved")
             continue
 
         if fail_code == "non_episode":
             skipped_non_episode += 1
             print("[SKIP ] LLM says non-episode/unknown")
-            skipped_files.append({"file": mkv.name, "reason": "identified as non-episode (featurette/extra)"})
+            _queue_or_skip("identified as non-episode (featurette/extra)")
             continue
 
         if fail_code == "low_conf":
             skipped_low_conf += 1
             conf = float((first_result or {}).get("confidence", 0.0))
             print(f"[SKIP ] confidence {conf:.2f} < {args.min_confidence:.2f}")
-            skipped_files.append({"file": mkv.name, "reason": f"low confidence ({conf:.2f})"})
+            _queue_or_skip(f"low confidence ({conf:.2f})")
             continue
 
         if fail_code == "missing_fields":
             skipped_missing_fields += 1
             print("[SKIP ] missing episode_number or episode_title")
-            skipped_files.append({"file": mkv.name, "reason": "LLM returned incomplete result"})
+            _queue_or_skip("LLM returned incomplete result")
             continue
 
         if fail_code == "verify_failed":
             skipped_verify_failed += 1
             print("[SKIP ] TMDB could not confirm episode number/title (preventing bad rename)")
-            skipped_files.append({"file": mkv.name, "reason": "TMDB could not verify episode"})
+            _queue_or_skip("TMDB could not verify episode")
             continue
 
         skipped_target_exists += 1
@@ -1667,6 +1680,50 @@ def main():
     print(f"  duplicate episode (conflict):     {skipped_conflict}")
     print(f"  missing episode number/title:     {skipped_missing_fields}")
     print(f"  target exists/other:              {skipped_target_exists}")
+
+    # Move unidentified files to Extras folders in the destination library.
+    if extras_queue:
+        from collections import defaultdict
+
+        def _next_extra_number(extras_dir: Path) -> int:
+            """Return the next available Extra_N index in extras_dir."""
+            if not extras_dir.exists():
+                return 1
+            highest = 0
+            for f in extras_dir.iterdir():
+                m = re.match(r"Extra_(\d+)", f.stem, re.IGNORECASE)
+                if m:
+                    highest = max(highest, int(m.group(1)))
+            return highest + 1
+
+        by_season: dict = defaultdict(list)
+        for mkv_path, show_name, season_num in extras_queue:
+            by_season[(show_name, season_num)].append(mkv_path)
+
+        for (show_name, season_num), paths in by_season.items():
+            show_s = sanitize_filename(show_name)
+            extras_dir = dest_root / show_s / f"Season {season_num:02d}" / "Extras"
+
+            if args.dry_run:
+                for p in paths:
+                    print(f"[EXTRA] DRYRUN {p.name} -> {extras_dir}/Extra_N{p.suffix}")
+                continue
+
+            extras_dir.mkdir(parents=True, exist_ok=True)
+            counter = _next_extra_number(extras_dir)
+            for p in paths:
+                dst = extras_dir / f"Extra_{counter}{p.suffix}"
+                while dst.exists():
+                    counter += 1
+                    dst = extras_dir / f"Extra_{counter}{p.suffix}"
+                try:
+                    shutil.move(str(p), str(dst))
+                    print(f"[EXTRA] {p.name} -> {dst}")
+                    extras_moved.append(f"{show_s} - S{season_num:02d} - {dst.name}")
+                    counter += 1
+                except Exception as e:
+                    print(f"[ERR  ] Could not move {p.name} to Extras: {e}")
+                    skipped_files.append({"file": p.name, "reason": f"Extras move failed: {e}"})
 
     # Remove empty directories left behind in --root after episodes were moved out.
     # Walk bottom-up so nested empties are removed before their parents are checked.
@@ -1695,6 +1752,7 @@ def main():
             "skipped_count": len(skipped_files),
             "renamed_episodes": renamed_episodes,
             "skipped_files": skipped_files,
+            "extras_moved": extras_moved,
         }
         try:
             Path(args.summary_json).write_text(json.dumps(summary, indent=2))

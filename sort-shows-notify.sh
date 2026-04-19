@@ -30,6 +30,7 @@ except Exception as e:
 
 renamed   = s.get("renamed_episodes", [])
 skipped   = s.get("skipped_files", [])
+extras    = s.get("extras_moved", [])
 dry_run   = s.get("dry_run", False)
 total     = s.get("total", 0)
 
@@ -41,8 +42,14 @@ if renamed:
     for ep in renamed:
         lines.append(f"  • {ep}")
 
+if extras:
+    label = "Would move" if dry_run else "Moved"
+    lines.append(f"\n📦 {label} {len(extras)} file(s) to Extras:")
+    for ex in extras:
+        lines.append(f"  • {ex}")
+
 if skipped:
-    lines.append(f"\n⚠️ {len(skipped)} file(s) could not be identified:")
+    lines.append(f"\n⚠️ {len(skipped)} file(s) could not be handled:")
     for item in skipped:
         lines.append(f"  • {item['file']} — {item['reason']}")
 
