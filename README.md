@@ -97,6 +97,23 @@ python Sort_TV.py --root /mnt/media/Video/Processed [flags]
 5. Claude identifies episode against the episode guide; TMDB verifies/corrects
 6. Duplicate detection — if two files claim the same episode, the second retries with audio
 
+**Handling compilation discs / kids specials not in TMDB**
+
+Place a `sort_hints.json` file inside the source folder to override folder-name parsing and bypass TMDB for content that isn't listed as a TV series (e.g. compilation discs, Dr. Seuss specials, holiday specials):
+
+```json
+{
+  "show": "Dr. Seuss Specials",
+  "season": 1,
+  "skip_tmdb": true
+}
+```
+
+- `show` + `season` — used directly, no Claude folder parse or TMDB canonicalization
+- `skip_tmdb: true` — skips TMDB episode guide fetch and verification; also tells the LLM that these are standalone programs in a compilation (so it won't reject them as "non-episodes")
+- Files are renamed `Dr. Seuss Specials - S01E01 - Daisy-Head Mayzie.mkv` etc.
+- Unidentifiable files still fall through to `Extras/` as usual
+
 ### Convert_Video.py
 
 Recursively re-encodes `.mkv` files to H.264/AAC using `ffmpeg` (GPU-accelerated via `h264_nvenc` when available).

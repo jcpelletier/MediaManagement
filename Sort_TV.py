@@ -467,7 +467,8 @@ def parse_show_and_season_from_folder(folder_name: str) -> Tuple[Optional[str], 
 
 def build_prompt(show: str, season: int, evidence_text: str, duration_minutes: float,
                  evidence_kind: str, episode_guide: Optional[str] = None,
-                 disc_context: Optional[List[str]] = None) -> str:
+                 disc_context: Optional[List[str]] = None,
+                 is_collection: bool = False) -> str:
     guide_section = ""
     if episode_guide:
         guide_section = (
@@ -504,13 +505,25 @@ def build_prompt(show: str, season: int, evidence_text: str, duration_minutes: f
             + ordering_hint
         )
 
+    if is_collection:
+        episode_hint = (
+            "- This is a compilation disc of standalone programs/specials. Each program is a "
+            "separate item — identify it and set is_episode=true if you can name it. "
+            "Only mark is_episode=false if the content is completely unidentifiable."
+        )
+    else:
+        episode_hint = (
+            "- The file may be a NON-EPISODE extra (featurette, recap, deleted scenes). "
+            "If so, mark is_episode=false."
+        )
+
     return f"""You are identifying TV episodes for file renaming.
 
 HINTS:
 - Show: {show}
 - Season: {season}
 - File duration: {duration_minutes:.1f} minutes
-- The file may be a NON-EPISODE extra (featurette, recap, deleted scenes). If so, mark is_episode=false.
+{episode_hint}
 {guide_section}{context_section}
 EVIDENCE TYPE:
 - {evidence_kind}
@@ -569,6 +582,7 @@ def call_llm_identify(
     evidence_kind: str,
     episode_guide: Optional[str] = None,
     disc_context: Optional[List[str]] = None,
+    is_collection: bool = False,
 ) -> dict:
     class _EpisodeID(BaseModel):
         is_episode: bool
@@ -580,7 +594,8 @@ def call_llm_identify(
         notes: str = ""
 
     prompt = build_prompt(show, season, evidence_text, duration_minutes, evidence_kind,
-                          episode_guide=episode_guide, disc_context=disc_context)
+                          episode_guide=episode_guide, disc_context=disc_context,
+                          is_collection=is_collection)
 
     resp = client.messages.parse(
         model=model,
@@ -1072,6 +1087,9 @@ def main():
     # Per-folder episode guide (fetched once from TMDB, keyed by (show, season)).
     episode_guide_cache: Dict[Tuple, Optional[str]] = {}
 
+    # Per-folder sort_hints.json overrides (keyed by folder name).
+    folder_hints_cache: Dict[str, dict] = {}
+
     # Per-folder disc context: episodes already identified from the current folder.
     # Reset each time we move to a new parent folder.
     _current_folder: Optional[str] = None
@@ -1089,17 +1107,37 @@ def main():
             continue
 
         folder = mkv.parent.name
-        vlog(f"[PARSE] Claude parsing folder name: \"{folder}\"")
-        show, season = parse_show_and_season_with_llm(anthropic_client, folder)
-        if not show or not season:
-            vlog("[PARSE] Claude parse missing fields; falling back to regex parsing.")
-            show, season = parse_show_and_season_from_folder(folder)
-        folder_parse_failed = not show or not season
-        if folder_parse_failed:
-            vlog(f"[PARSE] Folder \"{folder}\" yielded no show/season — will attempt blind identification from content.")
 
-        # TMDB show name canonicalization — only possible when folder gave us a show name
-        if not folder_parse_failed and tmdb_client is not None:
+        # Load sort_hints.json from the source folder (cached per folder).
+        if folder not in folder_hints_cache:
+            hints_path = mkv.parent / "sort_hints.json"
+            try:
+                folder_hints_cache[folder] = json.loads(hints_path.read_text()) if hints_path.exists() else {}
+            except Exception as e:
+                print(f"[WARN ] Could not read sort_hints.json in {folder}: {e}")
+                folder_hints_cache[folder] = {}
+        hints = folder_hints_cache[folder]
+        hints_show = str(hints.get("show", "")).strip()
+        hints_season = hints.get("season")
+        hints_skip_tmdb = bool(hints.get("skip_tmdb", False))
+
+        if hints_show and isinstance(hints_season, int) and hints_season >= 1:
+            show, season = hints_show, hints_season
+            folder_parse_failed = False
+            vlog(f"[HINT ] sort_hints.json: show={show!r} season={season} skip_tmdb={hints_skip_tmdb}")
+        else:
+            hints_skip_tmdb = False
+            vlog(f"[PARSE] Claude parsing folder name: \"{folder}\"")
+            show, season = parse_show_and_season_with_llm(anthropic_client, folder)
+            if not show or not season:
+                vlog("[PARSE] Claude parse missing fields; falling back to regex parsing.")
+                show, season = parse_show_and_season_from_folder(folder)
+            folder_parse_failed = not show or not season
+            if folder_parse_failed:
+                vlog(f"[PARSE] Folder \"{folder}\" yielded no show/season — will attempt blind identification from content.")
+
+        # TMDB show name canonicalization — skipped when hints override or skip_tmdb set
+        if not folder_parse_failed and not hints_skip_tmdb and tmdb_client is not None:
             try:
                 tmdb_show = tmdb_client.find_tv(show)
             except Exception as e:
@@ -1137,7 +1175,7 @@ def main():
 
         # Fetch episode guide from TMDB (cached per show+season) for LLM context
         episode_guide: Optional[str] = None
-        if not folder_parse_failed and tmdb_client is not None and show and season:
+        if not folder_parse_failed and not hints_skip_tmdb and tmdb_client is not None and show and season:
             guide_key = (show.lower(), season)
             if guide_key not in episode_guide_cache:
                 try:
@@ -1321,6 +1359,7 @@ def main():
                     anthropic_client, args.model, show, season, e_text, dur_m, e_kind,
                     episode_guide=episode_guide,
                     disc_context=list(disc_context_list) or None,
+                    is_collection=hints_skip_tmdb,
                 )
             except Exception as e:
                 errors += 1
@@ -1339,7 +1378,13 @@ def main():
             ep_num = result.get("episode_number", None)
             ep_title = result.get("episode_title", None)
 
-            if not is_episode:
+            # In collection mode (skip_tmdb), trust the LLM's title identification
+            # even if it flagged is_episode=false (standalone specials are not "episodes"
+            # in the traditional sense, but we still want to name them).
+            if not is_episode and not hints_skip_tmdb:
+                return False, result, "non_episode"
+            if not is_episode and hints_skip_tmdb and (not ep_title or conf < args.min_confidence):
+                # Truly unidentifiable even in collection mode
                 return False, result, "non_episode"
             if conf < args.min_confidence:
                 return False, result, "low_conf"
@@ -1349,7 +1394,7 @@ def main():
             final_ep_num = ep_num
             final_title = ep_title
 
-            if verify_api_enabled and tmdb_client is not None:
+            if verify_api_enabled and not hints_skip_tmdb and tmdb_client is not None:
                 try:
                     vres = verify_or_correct_with_tmdb(
                         tmdb=tmdb_client,
@@ -1378,6 +1423,8 @@ def main():
 
                 final_ep_num = vres.episode_number
                 final_title = vres.episode_title
+            elif hints_skip_tmdb and verbose:
+                print(f"[HINT ] TMDB verify skipped (sort_hints.json skip_tmdb=true)")
 
             # Duplicate detection: if another file this run already claimed this episode,
             # return "conflict" so the caller can retry with audio evidence instead.
