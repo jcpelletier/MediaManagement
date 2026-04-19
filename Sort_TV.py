@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import struct
 import tempfile
@@ -860,22 +861,43 @@ def verify_or_correct_with_tmdb(
 # Rename
 # ----------------------------
 
-def rename_in_place(src: Path, show: str, season: int, ep: int, title: str, dry_run: bool) -> bool:
+def rename_and_move(
+    src: Path,
+    show: str,
+    season: int,
+    ep: int,
+    title: str,
+    dry_run: bool,
+    dest_root: Optional[Path] = None,
+) -> bool:
     show_s = sanitize_filename(show)
     title_s = sanitize_filename(title)
     new_name = f"{show_s} - S{season:02d}E{ep:02d} - {title_s}{src.suffix}"
-    dst = src.with_name(new_name)
+
+    if dest_root is not None:
+        season_dir = dest_root / show_s / f"Season {season:02d}"
+        dst = season_dir / new_name
+    else:
+        dst = src.with_name(new_name)
 
     if dst.exists():
-        print(f"[SKIP ] target exists: {src.name} -> {dst.name}")
+        print(f"[SKIP ] target exists: {dst}")
         return False
 
     if dry_run:
-        print(f"[RENAME] DRYRUN {src.name} -> {dst.name}")
+        if dest_root is not None:
+            print(f"[RENAME] DRYRUN {src.name} -> {dst}")
+        else:
+            print(f"[RENAME] DRYRUN {src.name} -> {new_name}")
         return True
 
-    src.rename(dst)
-    print(f"[RENAME] {src.name} -> {dst.name}")
+    if dest_root is not None:
+        season_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        print(f"[MOVE  ] {src.name} -> {dst}")
+    else:
+        src.rename(dst)
+        print(f"[RENAME] {src.name} -> {new_name}")
     return True
 
 
@@ -886,6 +908,9 @@ def rename_in_place(src: Path, show: str, season: int, ep: int, title: str, dry_
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="Root folder containing season/disc folders (or a single folder).")
+    ap.add_argument("--dest", default=None,
+                    help="Library root to move identified episodes into (e.g. /mnt/media/Media/Shows). "
+                         "Creates <Show>/Season NN/ subdirs as needed. Omit to rename files in place.")
     ap.add_argument("--model", default="claude-sonnet-4-5", help="Anthropic model for episode identification when folder/season is known (default: claude-sonnet-4-5)")
     ap.add_argument("--blind-model", default="claude-sonnet-4-5", help="Anthropic model for blind identification (no folder hint; default: claude-sonnet-4-5)")
     ap.add_argument("--min-minutes", type=float, default=7.0, help="Skip files shorter than this (default: 7)")
@@ -925,6 +950,8 @@ def main():
     ap.add_argument("--tmdb-min-title-match", type=float, default=0.78,
                     help="Minimum title similarity (0-1) to confirm/correct using TMDB (default: 0.78).")
     args = ap.parse_args()
+
+    dest_root: Optional[Path] = Path(args.dest).expanduser().resolve() if args.dest else None
 
     verbose = not args.quiet
     audio_fallback_enabled = (not args.no_audio_fallback) and bool(args.audio_fallback)
@@ -994,6 +1021,10 @@ def main():
 
     vlog(f"Found {len(mkvs)} .mkv file(s).")
     vlog(f"Mode: {'DRY-RUN' if args.dry_run else 'RENAME'} | Model: {args.model} (blind: {args.blind_model}) | LLM conf >= {args.min_confidence}")
+    if dest_root:
+        vlog(f"Dest : {dest_root}")
+    else:
+        vlog("Dest : rename in place")
     vlog(
         f"Audio fallback: {'ON' if audio_fallback_enabled else 'OFF'} "
         f"(primary {PRIMARY_AUDIO_SECONDS:.0f}s @ {args.audio_start_seconds:.0f}s, "
@@ -1135,7 +1166,7 @@ def main():
                     ep_num, ep_title = os_match
                     if verbose:
                         print(f"[OSDB ] exact match -> S{season:02d}E{ep_num:02d} \"{ep_title}\"")
-                    ok = rename_in_place(mkv, show, season, ep_num, ep_title, args.dry_run)
+                    ok = rename_and_move(mkv, show, season, ep_num, ep_title, args.dry_run, dest_root)
                     if ok:
                         print("[DONE ] renamed (OpenSubtitles exact match)")
                         if args.dry_run:
@@ -1346,7 +1377,7 @@ def main():
                 return False, result, "conflict"
             episode_claims[claim_key] = mkv
 
-            ok = rename_in_place(mkv, show, season, final_ep_num, final_title, args.dry_run)
+            ok = rename_and_move(mkv, show, season, final_ep_num, final_title, args.dry_run, dest_root)
             if ok:
                 disc_context_list.append(f"S{season:02d}E{final_ep_num:02d} \"{final_title}\"")
                 return True, result, "renamed"
@@ -1447,7 +1478,7 @@ def main():
                     return False, result, "conflict"
                 episode_claims[claim_key] = mkv
 
-                ok = rename_in_place(mkv, final_show, final_season, final_ep_num, final_title, args.dry_run)
+                ok = rename_and_move(mkv, final_show, final_season, final_ep_num, final_title, args.dry_run, dest_root)
                 if ok:
                     disc_context_list.append(f"{final_show} S{final_season:02d}E{final_ep_num:02d} \"{final_title}\"")
                     if not args.dry_run:
