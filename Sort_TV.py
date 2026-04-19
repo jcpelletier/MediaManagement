@@ -405,7 +405,7 @@ def parse_show_and_season_with_llm(client: anthropic.Anthropic, folder_name: str
 
     try:
         resp = client.messages.parse(
-            model="claude-opus-4-6",
+            model="claude-haiku-3-5",
             max_tokens=256,
             system="Return only the structured JSON object that matches the schema.",
             messages=[{
@@ -868,7 +868,8 @@ def rename_in_place(src: Path, show: str, season: int, ep: int, title: str, dry_
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="Root folder containing season/disc folders (or a single folder).")
-    ap.add_argument("--model", default="claude-sonnet-4-5", help="Anthropic model name (default: claude-sonnet-4-5)")
+    ap.add_argument("--model", default="claude-haiku-3-5", help="Anthropic model for episode identification when folder/season is known (default: claude-haiku-3-5)")
+    ap.add_argument("--blind-model", default="claude-sonnet-4-5", help="Anthropic model for blind identification (no folder hint; default: claude-sonnet-4-5)")
     ap.add_argument("--min-minutes", type=float, default=7.0, help="Skip files shorter than this (default: 7)")
     ap.add_argument("--max-minutes", type=float, default=100.0, help="Skip files longer than this (default: 100)")
     ap.add_argument("--min-confidence", type=float, default=0.85, help="Only consider LLM result when confidence >= this (default: 0.85)")
@@ -974,7 +975,7 @@ def main():
         return
 
     vlog(f"Found {len(mkvs)} .mkv file(s).")
-    vlog(f"Mode: {'DRY-RUN' if args.dry_run else 'RENAME'} | Model: {args.model} | LLM conf >= {args.min_confidence}")
+    vlog(f"Mode: {'DRY-RUN' if args.dry_run else 'RENAME'} | Model: {args.model} (blind: {args.blind_model}) | LLM conf >= {args.min_confidence}")
     vlog(
         f"Audio fallback: {'ON' if audio_fallback_enabled else 'OFF'} "
         f"(primary {PRIMARY_AUDIO_SECONDS:.0f}s @ {args.audio_start_seconds:.0f}s, "
@@ -1339,7 +1340,7 @@ def main():
             def attempt_llm_with_evidence(stage: str, e_text: str, e_kind: str) -> Tuple[bool, Optional[dict], str]:  # noqa: F811
                 nonlocal errors, renamed_blind
                 try:
-                    result = call_llm_identify_blind(anthropic_client, args.model, e_text, dur_m, e_kind)
+                    result = call_llm_identify_blind(anthropic_client, args.blind_model, e_text, dur_m, e_kind)
                 except Exception as e:
                     errors += 1
                     print(f"[ERR  ] Blind LLM call failed ({stage}): {e}")
