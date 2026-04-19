@@ -468,7 +468,8 @@ def parse_show_and_season_from_folder(folder_name: str) -> Tuple[Optional[str], 
 def build_prompt(show: str, season: int, evidence_text: str, duration_minutes: float,
                  evidence_kind: str, episode_guide: Optional[str] = None,
                  disc_context: Optional[List[str]] = None,
-                 is_collection: bool = False) -> str:
+                 is_collection: bool = False,
+                 cross_disc_last_ep: Optional[int] = None) -> str:
     guide_section = ""
     if episode_guide:
         guide_section = (
@@ -517,6 +518,17 @@ def build_prompt(show: str, season: int, evidence_text: str, duration_minutes: f
             "If so, mark is_episode=false."
         )
 
+    cross_disc_section = ""
+    if cross_disc_last_ep is not None and not disc_context:
+        next_ep = cross_disc_last_ep + 1
+        cross_disc_section = (
+            f"\n## Cross-disc context\n"
+            f"Previous disc(s) for {show} Season {season:02d} have been identified up to "
+            f"E{cross_disc_last_ep:02d}. This disc most likely starts around E{next_ep:02d}. "
+            f"Only assign an episode number far from E{next_ep:02d} if the evidence clearly "
+            f"and unambiguously points elsewhere.\n"
+        )
+
     return f"""You are identifying TV episodes for file renaming.
 
 HINTS:
@@ -524,7 +536,7 @@ HINTS:
 - Season: {season}
 - File duration: {duration_minutes:.1f} minutes
 {episode_hint}
-{guide_section}{context_section}
+{cross_disc_section}{guide_section}{context_section}
 EVIDENCE TYPE:
 - {evidence_kind}
 
@@ -617,6 +629,7 @@ def call_llm_identify(
     episode_guide: Optional[str] = None,
     disc_context: Optional[List[str]] = None,
     is_collection: bool = False,
+    cross_disc_last_ep: Optional[int] = None,
 ) -> dict:
     class _EpisodeID(BaseModel):
         is_episode: bool
@@ -629,7 +642,7 @@ def call_llm_identify(
 
     prompt = build_prompt(show, season, evidence_text, duration_minutes, evidence_kind,
                           episode_guide=episode_guide, disc_context=disc_context,
-                          is_collection=is_collection)
+                          is_collection=is_collection, cross_disc_last_ep=cross_disc_last_ep)
 
     resp = client.messages.parse(
         model=model,
@@ -1128,6 +1141,10 @@ def main():
     # Per-folder sort_hints.json overrides (keyed by folder name).
     folder_hints_cache: Dict[str, dict] = {}
 
+    # Highest episode number identified so far per (show_key, season) across ALL disc folders.
+    # Used to give the LLM a cross-disc "previous disc ended at E{N}" hint.
+    show_season_last_ep: Dict[Tuple, int] = {}
+
     # Per-folder disc context: episodes already identified from the current folder.
     # Reset each time we move to a new parent folder.
     _current_folder: Optional[str] = None
@@ -1390,6 +1407,9 @@ def main():
         if verbose:
             print(f"[EVID ] {evidence_kind}")
 
+        _show_season_key = (norm_title(show) if show else "", season or 0)
+        _cross_disc_last = show_season_last_ep.get(_show_season_key) if (show and season and not disc_context_list) else None
+
         def attempt_llm_with_evidence(stage: str, e_text: str, e_kind: str) -> Tuple[bool, Optional[dict], str]:
             nonlocal errors
             try:
@@ -1398,6 +1418,7 @@ def main():
                     episode_guide=episode_guide,
                     disc_context=list(disc_context_list) or None,
                     is_collection=hints_skip_tmdb,
+                    cross_disc_last_ep=_cross_disc_last,
                 )
             except Exception as e:
                 errors += 1
@@ -1478,6 +1499,8 @@ def main():
             if ok:
                 disc_context_list.append(f"S{season:02d}E{final_ep_num:02d} \"{final_title}\"")
                 renamed_episodes.append(f"{sanitize_filename(show)} - S{season:02d}E{final_ep_num:02d} - {sanitize_filename(final_title)}")
+                sk = (norm_title(show), season)
+                show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
                 return True, result, "renamed"
             return False, result, "target_exists"
 
@@ -1587,6 +1610,8 @@ def main():
                 if ok:
                     disc_context_list.append(f"{final_show} S{final_season:02d}E{final_ep_num:02d} \"{final_title}\"")
                     renamed_episodes.append(f"{sanitize_filename(final_show)} - S{final_season:02d}E{final_ep_num:02d} - {sanitize_filename(final_title)}")
+                    sk = (norm_title(final_show), final_season)
+                    show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
                     if not args.dry_run:
                         renamed_blind += 1
                     return True, result, "renamed"
@@ -1622,6 +1647,43 @@ def main():
                 if verbose:
                     print("[RETRY] Audio unavailable for conflict retry")
                 fail_code = "conflict"
+
+        # Low-confidence subtitle result: retry with subtitle + audio combined evidence.
+        # This covers episodes where the subtitle beginning is generic but audio reveals more.
+        used_subtitles_as_primary = (evidence_text is not None) and (evidence_text != audio_transcript_primary)
+        if fail_code == "low_conf" and used_subtitles_as_primary and audio_fallback_enabled and whisper_model is not None:
+            if verbose:
+                print("[RETRY] Low subtitle confidence — supplementing with audio")
+            if audio_transcript_primary is None:
+                audio_transcript_primary, primary_actual_start = attempt_audio_transcribe(
+                    PRIMARY_AUDIO_SECONDS, "LOWCONF-AUDIO", primary_start
+                )
+                if audio_transcript_primary:
+                    used_audio_primary += 1
+            if audio_transcript_primary:
+                primary_label = primary_actual_start if primary_actual_start is not None else primary_start
+                combined_ev = (
+                    f"SUBTITLE EXCERPT:\n\"{evidence_text}\"\n\n"
+                    f"AUDIO TRANSCRIPT (Whisper, {PRIMARY_AUDIO_SECONDS:.0f}s @ {primary_label:.0f}s):\n"
+                    f"\"{audio_transcript_primary}\""
+                )
+                combined_kind = (
+                    f"subtitle excerpt + audio transcript "
+                    f"(Whisper, {PRIMARY_AUDIO_SECONDS:.0f}s @ {primary_label:.0f}s)"
+                )
+                renamed_ok2, second_result, fail_code2 = attempt_llm_with_evidence(
+                    "SUBTITLE+AUDIO", combined_ev, combined_kind
+                )
+                if renamed_ok2:
+                    print("[DONE ] renamed (after subtitle+audio fallback)")
+                    if args.dry_run:
+                        dryrun += 1
+                    else:
+                        renamed += 1
+                    continue
+                if second_result is not None:
+                    first_result = second_result
+                    fail_code = fail_code2
 
         used_primary_audio = (audio_transcript_primary is not None) and (evidence_text == audio_transcript_primary)
         if used_primary_audio and audio_fallback_enabled:
