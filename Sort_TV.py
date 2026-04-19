@@ -479,10 +479,28 @@ def build_prompt(show: str, season: int, evidence_text: str, duration_minutes: f
 
     context_section = ""
     if disc_context:
+        # Extract episode numbers already claimed on this disc to infer likely next episode.
+        claimed_nums = []
+        for entry in disc_context:
+            m = re.search(r"E(\d+)", entry, flags=re.IGNORECASE)
+            if m:
+                claimed_nums.append(int(m.group(1)))
+
+        ordering_hint = ""
+        if claimed_nums:
+            next_expected = max(claimed_nums) + 1
+            ordering_hint = (
+                f"\nDisc ordering hint: the highest episode identified so far on this disc is "
+                f"E{max(claimed_nums):02d}. Discs are usually sequential, so this file is most "
+                f"likely E{next_expected:02d} or nearby. Only deviate from this if the evidence "
+                f"strongly and clearly points to a different episode.\n"
+            )
+
         context_section = (
             "\n## Already identified from this disc (earlier files in this folder)\n"
             + "\n".join(f"  - {ep}" for ep in disc_context)
-            + "\nThese episodes are already taken — do not assign the same episode number to this file.\n"
+            + "\nThese episodes are already taken — do not assign the same episode number to this file."
+            + ordering_hint
         )
 
     return f"""You are identifying TV episodes for file renaming.
