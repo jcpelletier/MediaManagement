@@ -868,7 +868,7 @@ def rename_in_place(src: Path, show: str, season: int, ep: int, title: str, dry_
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="Root folder containing season/disc folders (or a single folder).")
-    ap.add_argument("--model", default="claude-haiku-3-5", help="Anthropic model for episode identification when folder/season is known (default: claude-haiku-3-5)")
+    ap.add_argument("--model", default="claude-haiku-4-5", help="Anthropic model for episode identification when folder/season is known (default: claude-haiku-4-5)")
     ap.add_argument("--blind-model", default="claude-sonnet-4-5", help="Anthropic model for blind identification (no folder hint; default: claude-sonnet-4-5)")
     ap.add_argument("--min-minutes", type=float, default=7.0, help="Skip files shorter than this (default: 7)")
     ap.add_argument("--max-minutes", type=float, default=100.0, help="Skip files longer than this (default: 100)")
