@@ -542,9 +542,32 @@ Evidence text:
 """
 
 
-def build_blind_prompt(evidence_text: str, duration_minutes: float, evidence_kind: str) -> str:
+def build_blind_prompt(evidence_text: str, duration_minutes: float, evidence_kind: str,
+                       disc_context: Optional[List[str]] = None) -> str:
     """Prompt used when no show/season hint is available from the folder name.
     Claude must identify the show, season, and episode entirely from content."""
+
+    context_section = ""
+    if disc_context:
+        claimed_nums = []
+        for entry in disc_context:
+            m = re.search(r"E(\d+)", entry, flags=re.IGNORECASE)
+            if m:
+                claimed_nums.append(int(m.group(1)))
+        ordering_hint = ""
+        if claimed_nums:
+            next_expected = max(claimed_nums) + 1
+            ordering_hint = (
+                f"\nDisc ordering hint: the highest episode identified so far is E{max(claimed_nums):02d}. "
+                f"This file is most likely E{next_expected:02d} or nearby.\n"
+            )
+        context_section = (
+            "\n## Already identified from this disc\n"
+            + "\n".join(f"  - {ep}" for ep in disc_context)
+            + "\nThese are already taken — assign a different episode number to this file."
+            + ordering_hint
+        )
+
     return f"""You are identifying video content for file renaming.
 
 No folder name is available. Identify the content entirely from the evidence below.
@@ -566,14 +589,14 @@ WHAT COUNTS AS is_episode=false (only these):
 
 EVIDENCE TYPE:
 - {evidence_kind}
-
+{context_section}
 TASK:
 Using ONLY the evidence text below, decide:
 - is_episode (true/false — use the definitions above)
 - If is_episode=true: show name (or collection name), season number (integer >= 1), episode_number (1-based), and episode_title
 - confidence from 0.0 to 1.0
 
-For standalone specials/films: use a logical collection name as the show (e.g. "Dr. Seuss Specials"), season 1, and number episodes sequentially. Be conservative with confidence — only high confidence when evidence clearly and unambiguously identifies the content.
+For standalone specials/films: use a consistent collection name as the show (e.g. "Dr. Seuss Specials"), season 1, and number episodes sequentially. Be conservative with confidence — only high confidence when evidence clearly and unambiguously identifies the content.
 Evidence may include multiple separate clips from the same file; they are not necessarily contiguous and should be treated as separate excerpts.
 
 Evidence text:
@@ -634,6 +657,7 @@ def call_llm_identify_blind(
     evidence_text: str,
     duration_minutes: float,
     evidence_kind: str,
+    disc_context: Optional[List[str]] = None,
 ) -> dict:
     """Blind identification — no show/season hints. Claude infers everything from content."""
     class _EpisodeIDBlind(BaseModel):
@@ -645,7 +669,8 @@ def call_llm_identify_blind(
         confidence: float
         notes: str = ""
 
-    prompt = build_blind_prompt(evidence_text, duration_minutes, evidence_kind)
+    prompt = build_blind_prompt(evidence_text, duration_minutes, evidence_kind,
+                               disc_context=disc_context)
 
     resp = client.messages.parse(
         model=model,
@@ -724,6 +749,8 @@ class TmdbClient:
         params = dict(params or {})
         params["api_key"] = self.api_key
         r = requests.get(url, params=params, timeout=self.timeout_s)
+        if r.status_code == 404:
+            return {}   # treat as "not found" rather than raising
         r.raise_for_status()
         return r.json()
 
@@ -1460,7 +1487,8 @@ def main():
             def attempt_llm_with_evidence(stage: str, e_text: str, e_kind: str) -> Tuple[bool, Optional[dict], str]:  # noqa: F811
                 nonlocal errors, renamed_blind
                 try:
-                    result = call_llm_identify_blind(anthropic_client, args.blind_model, e_text, dur_m, e_kind)
+                    result = call_llm_identify_blind(anthropic_client, args.blind_model, e_text, dur_m, e_kind,
+                                                    disc_context=list(disc_context_list) or None)
                 except Exception as e:
                     errors += 1
                     print(f"[ERR  ] Blind LLM call failed ({stage}): {e}")
