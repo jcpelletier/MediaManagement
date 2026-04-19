@@ -353,7 +353,7 @@ def call_claude(
 
     try:
         response = client.messages.parse(
-            model="claude-opus-4-6",
+            model="claude-sonnet-4-5",
             max_tokens=256,
             system=(
                 "You are a movie identifier. Given a folder name, video files, and optionally "
