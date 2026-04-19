@@ -1668,6 +1668,25 @@ def main():
     print(f"  missing episode number/title:     {skipped_missing_fields}")
     print(f"  target exists/other:              {skipped_target_exists}")
 
+    # Remove empty directories left behind in --root after episodes were moved out.
+    # Walk bottom-up so nested empties are removed before their parents are checked.
+    # Skipped in dry-run mode.
+    if dest_root and not args.dry_run:
+        removed_dirs = 0
+        for dirpath, dirnames, filenames in os.walk(args.root, topdown=False):
+            d = Path(dirpath)
+            if d == Path(args.root):
+                continue  # never remove the root itself
+            try:
+                if not any(d.iterdir()):
+                    d.rmdir()
+                    print(f"[RMDIR] {d}")
+                    removed_dirs += 1
+            except OSError:
+                pass  # non-empty or permission issue — leave it
+        if removed_dirs:
+            print(f"Removed {removed_dirs} empty director{'y' if removed_dirs == 1 else 'ies'} from {args.root}")
+
     if args.summary_json:
         summary = {
             "total": total,
