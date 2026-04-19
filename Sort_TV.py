@@ -545,24 +545,35 @@ Evidence text:
 def build_blind_prompt(evidence_text: str, duration_minutes: float, evidence_kind: str) -> str:
     """Prompt used when no show/season hint is available from the folder name.
     Claude must identify the show, season, and episode entirely from content."""
-    return f"""You are identifying TV episodes for file renaming.
+    return f"""You are identifying video content for file renaming.
 
-No folder name is available. Identify the show, season, and episode entirely from the evidence below.
+No folder name is available. Identify the content entirely from the evidence below.
 
 FILE INFO:
 - Duration: {duration_minutes:.1f} minutes
-- The file may be a NON-EPISODE extra (featurette, recap, deleted scenes). If so, mark is_episode=false.
+
+WHAT COUNTS AS is_episode=true:
+- TV series episodes
+- Standalone TV specials, holiday specials, or animated adaptations (e.g. "Dr. Seuss: Horton Hatches the Egg")
+- Short films or TV movies with a clear identifiable title
+- Any named video content you can identify
+
+WHAT COUNTS AS is_episode=false (only these):
+- Production featurettes, behind-the-scenes, making-of clips
+- Trailers or promotional material
+- Disc menus or navigation content
+- Content you genuinely cannot identify at all
 
 EVIDENCE TYPE:
 - {evidence_kind}
 
 TASK:
 Using ONLY the evidence text below, decide:
-- is_episode (true/false)
-- If is_episode=true: show name, season number (integer >= 1), episode_number (1-based integer within the season), and episode_title
+- is_episode (true/false — use the definitions above)
+- If is_episode=true: show name (or collection name), season number (integer >= 1), episode_number (1-based), and episode_title
 - confidence from 0.0 to 1.0
 
-Be conservative with confidence. Only return high confidence when the evidence clearly and unambiguously identifies the specific episode. If in doubt, return low confidence rather than guessing.
+For standalone specials/films: use a logical collection name as the show (e.g. "Dr. Seuss Specials"), season 1, and number episodes sequentially. Be conservative with confidence — only high confidence when evidence clearly and unambiguously identifies the content.
 Evidence may include multiple separate clips from the same file; they are not necessarily contiguous and should be treated as separate excerpts.
 
 Evidence text:
@@ -1469,7 +1480,7 @@ def main():
                     else:
                         print(f"[LLM  ] {stage} (blind) -> non-episode/unknown (conf={conf:.2f}) ✗")
                     notes = one_line(result.get("notes", ""), 140)
-                    if notes and conf < args.min_confidence:
+                    if notes and (not is_ep or conf < args.min_confidence):
                         print(f"       reason: {notes}")
 
                 if not is_ep:
@@ -1493,38 +1504,44 @@ def main():
                         errors += 1
                         print(f"[ERR  ] TMDB show lookup (blind) failed: {e}")
                         return False, result, "verify_error"
+
                     if tmdb_show_result:
                         if verbose and norm_title(tmdb_show_result.name) != norm_title(blind_show):
                             print(f"[API  ] TMDB canonical show -> \"{tmdb_show_result.name}\"")
                         final_show = tmdb_show_result.name
 
-                    # Verify episode
-                    try:
-                        vres = verify_or_correct_with_tmdb(
-                            tmdb=tmdb_client,
-                            show=final_show,
-                            season=blind_season,
-                            proposed_ep_num=ep_num,
-                            proposed_title=ep_title,
-                            min_title_match=float(args.tmdb_min_title_match),
-                        )
-                    except Exception as e:
-                        errors += 1
-                        print(f"[ERR  ] TMDB verify (blind) failed: {e}")
-                        return False, result, "verify_error"
+                        # Show found — verify the episode
+                        try:
+                            vres = verify_or_correct_with_tmdb(
+                                tmdb=tmdb_client,
+                                show=final_show,
+                                season=blind_season,
+                                proposed_ep_num=ep_num,
+                                proposed_title=ep_title,
+                                min_title_match=float(args.tmdb_min_title_match),
+                            )
+                        except Exception as e:
+                            errors += 1
+                            print(f"[ERR  ] TMDB verify (blind) failed: {e}")
+                            return False, result, "verify_error"
 
-                    if verbose:
-                        if vres.ok:
-                            tag = "corrected" if vres.corrected else "confirmed"
-                            print(f"[API  ] TMDB {tag}  -> S{blind_season:02d}E{vres.episode_number:02d} \"{vres.episode_title}\" (match={vres.match_score:.2f})")
-                        else:
-                            print(f"[API  ] TMDB reject     -> {vres.reason}")
+                        if verbose:
+                            if vres.ok:
+                                tag = "corrected" if vres.corrected else "confirmed"
+                                print(f"[API  ] TMDB {tag}  -> S{blind_season:02d}E{vres.episode_number:02d} \"{vres.episode_title}\" (match={vres.match_score:.2f})")
+                            else:
+                                print(f"[API  ] TMDB reject     -> {vres.reason}")
 
-                    if not vres.ok or vres.episode_number is None or not vres.episode_title:
-                        return False, result, "verify_failed"
+                        if not vres.ok or vres.episode_number is None or not vres.episode_title:
+                            return False, result, "verify_failed"
 
-                    final_ep_num = vres.episode_number
-                    final_title = vres.episode_title
+                        final_ep_num = vres.episode_number
+                        final_title = vres.episode_title
+                    else:
+                        # Show not found in TMDB — likely a standalone special, TV movie, or
+                        # compilation content not catalogued as a TV series. Trust the LLM.
+                        if verbose:
+                            print(f"[API  ] TMDB: show not found — trusting LLM identification (conf={conf:.2f})")
                 else:
                     if verbose:
                         print("[WARN ] Blind identification without TMDB verification — accuracy not guaranteed.")
