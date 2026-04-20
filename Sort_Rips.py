@@ -390,11 +390,12 @@ def rename_and_move(
     dest_root: Path,
     overwrite: bool,
     dry_run: bool,
-) -> None:
+) -> Optional[str]:
+    """Return the destination filename on success (including dry-run), None if skipped."""
     title = sanitize_title(guess.title)
     if not title:
         print(f"SKIP: Empty title after sanitization for {largest_file.parent.name}")
-        return
+        return None
 
     new_name = f"{title}{f' ({guess.year})' if guess.year else ''}{largest_file.suffix}"
     renamed_path = largest_file.with_name(new_name)
@@ -402,13 +403,13 @@ def rename_and_move(
 
     if dest_path.exists() and not overwrite:
         print(f"SKIP: Destination exists, use --overwrite to replace: {dest_path}")
-        return
+        return None
 
     print(f"  Rename: {largest_file.name} -> {renamed_path.name}")
     print(f"  Move  : {renamed_path} -> {dest_path}")
 
     if dry_run:
-        return
+        return new_name
 
     if not dest_root.exists():
         dest_root.mkdir(parents=True, exist_ok=True)
@@ -419,8 +420,10 @@ def rename_and_move(
         if dest_path.exists() and overwrite:
             dest_path.unlink()
         shutil.move(str(renamed_path), str(dest_path))
+        return new_name
     except Exception as exc:
         print(f"  ERROR: Could not move '{largest_file}': {exc}")
+        return None
 
 
 def move_folder_to_processed(folder: Path, processed_root: Path, dry_run: bool) -> None:
@@ -461,14 +464,15 @@ def _finalize(
     dry_run: bool,
     tmdb_client: Optional[TmdbMovieClient],
     tmdb_min_title_match: float,
-) -> None:
+) -> Optional[str]:
+    """Return the destination filename on success, None if skipped."""
     if tmdb_client is not None:
         verified = verify_movie_with_tmdb(tmdb_client, guess, tmdb_min_title_match)
         if verified is None:
             print(f"SKIP: TMDB could not confirm '{guess.title}' — preventing bad rename")
-            return
+            return None
         guess = verified
-    rename_and_move(largest_file, guess, dest_root, overwrite, dry_run)
+    return rename_and_move(largest_file, guess, dest_root, overwrite, dry_run)
 
 
 # ─── main processing ─────────────────────────────────────────────────────────
@@ -487,10 +491,11 @@ def process_folder(
     whisper_base_seconds: float = WHISPER_BASE_SECONDS_DEFAULT,
     tmdb_client: Optional[TmdbMovieClient] = None,
     tmdb_min_title_match: float = 0.78,
-) -> None:
+) -> Tuple[Optional[str], Optional[str]]:
+    """Process one folder. Returns (moved_filename, skip_reason). Exactly one is non-None."""
     video_files = collect_video_files(folder, extensions)
     if not video_files:
-        return
+        return None, "no video files"
 
     largest_file = max(video_files, key=lambda p: p.stat().st_size)
     files_summary = format_files_for_prompt(video_files)
@@ -501,24 +506,28 @@ def process_folder(
 
     guess = call_claude(anthropic_client, folder.name, files_summary, evidence_text=initial_evidence)
     if not guess:
-        return
+        return None, "LLM call failed"
 
     src = "subtitles" if subtitle_text else "filenames only"
     print(f"  [LLM  ] First pass ({src}): '{guess.title}' ({guess.year}) conf={guess.confidence:.2f}")
 
     if guess.confidence >= min_confidence:
-        _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match)
-        return
+        result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match)
+        if result:
+            return result, None
+        return None, f"TMDB could not confirm '{guess.title}'"
 
     # ── tier 3: local Whisper audio fallback ─────────────────────────────────
     if whisper_model is None:
+        reason = f"low confidence ({guess.confidence:.2f}) and Whisper not available"
         print(f"SKIP: Low confidence ({guess.confidence:.2f}) and Whisper not available")
-        return
+        return None, reason
 
     dur_s = ffprobe_duration_seconds(largest_file)
     if dur_s is None:
-        print(f"SKIP: Low confidence ({guess.confidence:.2f}) — cannot read video duration")
-        return
+        reason = f"low confidence ({guess.confidence:.2f}) — cannot read video duration"
+        print(f"SKIP: {reason}")
+        return None, reason
 
     audio_clips: List[str] = []
 
@@ -564,10 +573,14 @@ def process_folder(
         print(f"  [LLM  ] Attempt {attempt}: '{guess.title}' ({guess.year}) conf={guess.confidence:.2f}")
 
         if guess.confidence >= min_confidence:
-            _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match)
-            return
+            result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match)
+            if result:
+                return result, None
+            return None, f"TMDB could not confirm '{guess.title}'"
 
-    print(f"SKIP: Low confidence ({guess.confidence:.2f}) after all Whisper attempts for '{folder.name}'")
+    reason = f"low confidence ({guess.confidence:.2f}) after all Whisper attempts"
+    print(f"SKIP: {reason} for '{folder.name}'")
+    return None, reason
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -614,6 +627,9 @@ def parse_args() -> argparse.Namespace:
                    help="TMDB API key (or set TMDB_KEY env var).")
     t.add_argument("--tmdb-min-title-match", type=float, default=0.78,
                    help="Minimum title similarity to confirm via TMDB (default: 0.78)")
+
+    parser.add_argument("--summary-json", type=str, default=None,
+                        help="Write a JSON summary of moved/skipped folders to this path.")
 
     return parser.parse_args()
 
@@ -713,9 +729,12 @@ def main() -> None:
         print("No subdirectories found to process.")
         return
 
+    moved_movies: List[str] = []
+    skipped_folders: List[dict] = []
+
     for folder in sorted(subfolders):
         print(f"\nFolder: {folder.name}")
-        process_folder(
+        moved, reason = process_folder(
             folder=folder,
             extensions=extensions,
             anthropic_client=anthropic_client,
@@ -730,7 +749,25 @@ def main() -> None:
             tmdb_client=tmdb_client,
             tmdb_min_title_match=args.tmdb_min_title_match,
         )
+        if moved:
+            moved_movies.append(moved)
+        elif reason and reason != "no video files":
+            skipped_folders.append({"folder": folder.name, "reason": reason})
         move_folder_to_processed(folder, processed_root, args.dry_run)
+
+    if args.summary_json:
+        summary = {
+            "moved_movies": moved_movies,
+            "skipped_folders": skipped_folders,
+            "dry_run": args.dry_run,
+            "total": len(moved_movies) + len(skipped_folders),
+        }
+        try:
+            with open(args.summary_json, "w") as f:
+                json.dump(summary, f, indent=2)
+            print(f"\nSummary written to {args.summary_json}")
+        except Exception as exc:
+            print(f"WARN: Could not write summary JSON: {exc}")
 
 
 if __name__ == "__main__":
