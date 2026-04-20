@@ -390,29 +390,41 @@ def rename_and_move(
     dest_root: Path,
     overwrite: bool,
     dry_run: bool,
+    extra_files: Optional[List[Path]] = None,
 ) -> Optional[str]:
-    """Return the destination filename on success (including dry-run), None if skipped."""
+    """Return the destination filename on success (including dry-run), None if skipped.
+
+    The main movie lands at dest_root/Title (Year)/Title (Year).ext.
+    Any extra_files are moved to dest_root/Title (Year)/Extras/.
+    """
     title = sanitize_title(guess.title)
     if not title:
         print(f"SKIP: Empty title after sanitization for {largest_file.parent.name}")
         return None
 
-    new_name = f"{title}{f' ({guess.year})' if guess.year else ''}{largest_file.suffix}"
+    year_part = f" ({guess.year})" if guess.year else ""
+    folder_name = f"{title}{year_part}"
+    new_name = f"{folder_name}{largest_file.suffix}"
     renamed_path = largest_file.with_name(new_name)
-    dest_path = dest_root / new_name
+    movie_dir = dest_root / folder_name
+    dest_path = movie_dir / new_name
 
     if dest_path.exists() and not overwrite:
         print(f"SKIP: Destination exists, use --overwrite to replace: {dest_path}")
         return None
 
+    extras = [f for f in (extra_files or []) if f.exists()]
+
     print(f"  Rename: {largest_file.name} -> {renamed_path.name}")
     print(f"  Move  : {renamed_path} -> {dest_path}")
+    for ef in sorted(extras):
+        print(f"  Extras: {ef.name} -> {movie_dir / 'Extras' / ef.name}")
 
     if dry_run:
         return new_name
 
-    if not dest_root.exists():
-        dest_root.mkdir(parents=True, exist_ok=True)
+    if not movie_dir.exists():
+        movie_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         if largest_file != renamed_path:
@@ -420,10 +432,24 @@ def rename_and_move(
         if dest_path.exists() and overwrite:
             dest_path.unlink()
         shutil.move(str(renamed_path), str(dest_path))
-        return new_name
     except Exception as exc:
         print(f"  ERROR: Could not move '{largest_file}': {exc}")
         return None
+
+    if extras:
+        extras_dir = movie_dir / "Extras"
+        extras_dir.mkdir(exist_ok=True)
+        for ef in sorted(extras):
+            extras_dest = extras_dir / ef.name
+            if extras_dest.exists() and not overwrite:
+                print(f"  SKIP extras: {ef.name} already exists in Extras")
+                continue
+            try:
+                shutil.move(str(ef), str(extras_dest))
+            except Exception as exc:
+                print(f"  ERROR: Could not move extra '{ef}': {exc}")
+
+    return new_name
 
 
 def move_folder_to_processed(folder: Path, processed_root: Path, dry_run: bool) -> None:
@@ -464,6 +490,7 @@ def _finalize(
     dry_run: bool,
     tmdb_client: Optional[TmdbMovieClient],
     tmdb_min_title_match: float,
+    extra_files: Optional[List[Path]] = None,
 ) -> Optional[str]:
     """Return the destination filename on success, None if skipped."""
     if tmdb_client is not None:
@@ -472,7 +499,7 @@ def _finalize(
             print(f"SKIP: TMDB could not confirm '{guess.title}' — preventing bad rename")
             return None
         guess = verified
-    return rename_and_move(largest_file, guess, dest_root, overwrite, dry_run)
+    return rename_and_move(largest_file, guess, dest_root, overwrite, dry_run, extra_files=extra_files)
 
 
 # ─── main processing ─────────────────────────────────────────────────────────
@@ -498,6 +525,7 @@ def process_folder(
         return None, "no video files"
 
     largest_file = max(video_files, key=lambda p: p.stat().st_size)
+    extra_files = [f for f in video_files if f != largest_file]
     files_summary = format_files_for_prompt(video_files)
 
     # ── tier 1 + 2: folder/file metadata + subtitles ─────────────────────────
@@ -512,7 +540,7 @@ def process_folder(
     print(f"  [LLM  ] First pass ({src}): '{guess.title}' ({guess.year}) conf={guess.confidence:.2f}")
 
     if guess.confidence >= min_confidence:
-        result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match)
+        result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match, extra_files=extra_files)
         if result:
             return result, None
         return None, f"TMDB could not confirm '{guess.title}'"
@@ -573,7 +601,7 @@ def process_folder(
         print(f"  [LLM  ] Attempt {attempt}: '{guess.title}' ({guess.year}) conf={guess.confidence:.2f}")
 
         if guess.confidence >= min_confidence:
-            result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match)
+            result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match, extra_files=extra_files)
             if result:
                 return result, None
             return None, f"TMDB could not confirm '{guess.title}'"
