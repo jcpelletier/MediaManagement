@@ -58,8 +58,19 @@ python Sort_Rips.py \
   [--dry-run]
 ```
 
+**Output structure**
+
+Each identified movie gets its own subfolder under `--dest`:
+```
+Movies/
+  The Matrix (1999)/
+    The Matrix (1999).mkv      ← largest video file, renamed
+    Extras/
+      bonus_feature.mkv        ← any other video files from the source folder
+```
+
 - TV show folders are correctly skipped — TMDB movie search rejects them, and they pass through to `Sort_TV.py` via the Processed directory.
-- After processing, each folder is moved to `--processed` regardless of outcome.
+- After processing, non-video leftovers (subtitles, nfo files, etc.) are moved to `--processed`. If all files were moved to the library the source folder is deleted.
 
 ### Sort_TV.py
 
