@@ -755,6 +755,9 @@ def main() -> None:
     ]
     if not subfolders:
         print("No subdirectories found to process.")
+        if args.summary_json:
+            with open(args.summary_json, "w") as f:
+                json.dump({"moved_movies": [], "skipped_folders": [], "dry_run": args.dry_run, "total": 0}, f)
         return
 
     moved_movies: List[str] = []
