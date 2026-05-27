@@ -1,0 +1,15 @@
+FROM jenkins/jenkins:lts
+USER root
+RUN apt-get update && \
+    apt-get install -y ffmpeg python3-pip python3-venv git && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip3 install --break-system-packages \
+    anthropic \
+    pydantic \
+    requests \
+    openai-whisper \
+    playwright \
+    opencensus-ext-azure
+RUN python3 -m playwright install-deps chromium
+RUN python3 -m playwright install chromium
+USER jenkins
