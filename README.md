@@ -6,7 +6,9 @@ Scripts for ripping, sorting, and converting media on **panda** (Ubuntu Server 2
 
 | Variable | Used by |
 |---|---|
-| `ANTHROPIC_API_KEY` | Sort_Rips.py, Sort_TV.py |
+| `DEEPSEEK_API_KEY` | Sort_Rips.py, Sort_TV.py |
+| `DEEPSEEK_BASE_URL` | Sort_Rips.py, Sort_TV.py (optional; default `https://api.deepseek.com`) |
+| `DEEPSEEK_MODEL` | Sort_Rips.py, Sort_TV.py (optional; default `deepseek-chat`) |
 | `TMDB_API_KEY` | Sort_Rips.py, Sort_TV.py |
 | `OPENSUB_API_KEY` | Sort_TV.py (optional) |
 
@@ -46,7 +48,7 @@ Rips a CD to FLAC via `abcde` (config at `/etc/abcde-rip.conf`) into `/mnt/media
 
 ### Sort_Rips.py
 
-Identifies and moves ripped movie folders from `/mnt/media/Video` to `/mnt/media/Media/Movies`. Uses Claude to guess the title from folder name, file list, and subtitle/audio evidence, then verifies against TMDB.
+Identifies and moves ripped movie folders from `/mnt/media/Video` to `/mnt/media/Media/Movies`. Uses DeepSeek to guess the title from folder name, file list, and subtitle/audio evidence, then verifies against TMDB.
 
 **Usage**
 ```bash
@@ -74,7 +76,7 @@ Movies/
 
 ### Sort_TV.py
 
-Identifies and renames TV episode `.mkv` files in place. Parses show/season from the parent folder name (e.g. `DS9S1D2`), extracts subtitle or audio evidence, asks Claude to identify the episode, then verifies against TMDB.
+Identifies and renames TV episode `.mkv` files in place. Parses show/season from the parent folder name (e.g. `DS9S1D2`), extracts subtitle or audio evidence, asks DeepSeek to identify the episode, then verifies against TMDB.
 
 **Usage**
 ```bash
@@ -86,9 +88,9 @@ python Sort_TV.py --root /mnt/media/Video/Processed [flags]
 | Flag | Default | Description |
 |---|---|---|
 | `--root` | *(required)* | Folder to scan recursively for `.mkv` files |
-| `--model` | `claude-sonnet-4-5` | Model for guided identification (show/season known) |
-| `--blind-model` | `claude-sonnet-4-5` | Model for blind identification (no folder hint) |
-| `--min-minutes` | `7.0` | Skip files shorter than this |
+| `--model` | `deepseek-chat` | Model for guided identification (show/season known) |
+| `--blind-model` | `deepseek-chat` | Model for blind identification (no folder hint) |
+| `--min-minutes` | `6.0` | Skip files shorter than this (low enough for short-form kids' episodes) |
 | `--max-minutes` | `100.0` | Skip files longer than this (allows 2-part episodes) |
 | `--min-confidence` | `0.85` | Minimum LLM confidence to rename |
 | `--whisper-model` | `small` | faster-whisper model size |
@@ -101,11 +103,11 @@ python Sort_TV.py --root /mnt/media/Video/Processed [flags]
 
 **Identification pipeline**
 
-1. Parse show + season from folder name via Claude (Sonnet) with regex fallback
+1. Parse show + season from folder name via DeepSeek with regex fallback
 2. Fetch episode guide (titles, runtimes, synopses) from TMDB for LLM context
 3. Extract subtitle excerpt (sampled from beginning, 25%, and 50% of file)
 4. If no subtitles: Whisper audio transcription (primary clip → second clip → deep fallback)
-5. Claude identifies episode against the episode guide; TMDB verifies/corrects
+5. DeepSeek identifies episode against the episode guide; TMDB verifies/corrects
 6. Duplicate detection — if two files claim the same episode, the second retries with audio
 
 **Handling compilation discs / kids specials not in TMDB**
@@ -120,7 +122,7 @@ Place a `sort_hints.json` file inside the source folder to override folder-name 
 }
 ```
 
-- `show` + `season` — used directly, no Claude folder parse or TMDB canonicalization
+- `show` + `season` — used directly, no DeepSeek folder parse or TMDB canonicalization
 - `skip_tmdb: true` — skips TMDB episode guide fetch and verification; also tells the LLM that these are standalone programs in a compilation (so it won't reject them as "non-episodes")
 - Files are renamed `Dr. Seuss Specials - S01E01 - Daisy-Head Mayzie.mkv` etc.
 - Unidentifiable files still fall through to `Extras/` as usual

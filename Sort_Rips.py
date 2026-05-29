@@ -11,8 +11,8 @@ Evidence tiers (cheapest/fastest first):
 
 Requires:
 - ffprobe / ffmpeg on PATH
-- ANTHROPIC_API_KEY env var
-- pip install anthropic pydantic requests
+- DEEPSEEK_API_KEY env var
+- pip install pydantic requests
 - pip install faster-whisper   (only when Whisper fallback is enabled)
 - TMDB_KEY env var or --tmdb-api-key  (for TMDB verification)
 """
@@ -30,9 +30,10 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-import anthropic
 import requests
 from pydantic import BaseModel
+
+from llm_deepseek import DeepSeekClient, DeepSeekError, DeepSeekAuthError
 
 try:
     from faster_whisper import WhisperModel as _WhisperModel
@@ -50,6 +51,11 @@ DEFAULT_EXTENSIONS = [
 WHISPER_INTERVAL_SECONDS_DEFAULT = 300.0  # sample at 5, 10, 15 min (1×, 2×, 3× this value)
 WHISPER_BASE_SECONDS_DEFAULT     = 60.0   # initial clip duration; doubles each retry (60, 120, 240s)
 WHISPER_MAX_ATTEMPTS             = 3      # attempts at 5 min, 10 min, 15 min
+
+# Sentinel skip reason for folders that look like episodic TV discs. These are
+# intentionally left for Sort_TV.py to handle, so they are NOT reported as
+# "could not be identified" failures in the summary.
+TV_DISC_DEFER_REASON = "looks like a TV disc — deferring to Sort_TV"
 
 
 # ─── data classes ────────────────────────────────────────────────────────────
@@ -100,6 +106,37 @@ def format_files_for_prompt(files: List[Path]) -> str:
 
 def sanitize_title(title: str) -> str:
     return re.sub(r'[<>:"/\\|?*]+', " ", title).strip()
+
+
+def looks_like_tv_disc(folder_name: str, video_files: List[Path]) -> Tuple[bool, str]:
+    """Heuristic: is this folder an episodic TV disc rather than a movie?
+
+    Movie discs have one dominant feature file (plus maybe a couple of small
+    extras). TV discs have several similarly-sized titles (the episodes) and
+    often a season/episode marker in the disc/folder name. When this returns
+    True the folder is left for Sort_TV.py instead of being force-matched
+    against TMDB's movie index (which fuzzy-matches short show names like
+    "Bluey" and wrongly files a single episode as a movie).
+    """
+    # High-confidence name markers. Bare "Disc N" is deliberately excluded
+    # because multi-disc movie releases use it too.
+    if re.search(r"\bseasons?\b", folder_name, flags=re.IGNORECASE):
+        return True, "folder name contains 'season'"
+    if re.search(r"\bepisodes?\b", folder_name, flags=re.IGNORECASE):
+        return True, "folder name contains 'episode'"
+    if re.search(r"\bS\d{1,2}[\s._-]*E\d{1,3}\b", folder_name, flags=re.IGNORECASE):
+        return True, "folder name has an SxxExx marker"
+
+    # Structural signal: several similarly-sized titles => episodic disc.
+    # A movie's main feature dominates total size; episodes are each ~1/N.
+    sizes = sorted((f.stat().st_size for f in video_files), reverse=True)
+    if len(sizes) >= 4:
+        largest = sizes[0]
+        if largest > 0:
+            similar = sum(1 for s in sizes if s >= 0.7 * largest)
+            if similar >= 4:
+                return True, f"{similar} similarly-sized titles suggest an episodic disc"
+    return False, ""
 
 
 # ─── subtitle extraction ─────────────────────────────────────────────────────
@@ -336,8 +373,8 @@ def verify_movie_with_tmdb(
 
 # ─── Claude ──────────────────────────────────────────────────────────────────
 
-def call_claude(
-    client: anthropic.Anthropic,
+def call_llm(
+    client: DeepSeekClient,
     folder_name: str,
     files_summary: str,
     evidence_text: Optional[str] = None,
@@ -352,22 +389,22 @@ def call_claude(
         user_content += f"\n\nAdditional evidence (subtitles / audio transcript):\n{evidence_text}"
 
     try:
-        response = client.messages.parse(
-            model="claude-sonnet-4-5",
-            max_tokens=256,
+        data = client.parse(
             system=(
                 "You are a movie identifier. Given a folder name, video files, and optionally "
                 "subtitle or audio transcript evidence, return the most likely movie title and "
                 "release year. If unsure, return an empty title and confidence 0."
             ),
-            messages=[{"role": "user", "content": user_content}],
-            output_format=_MovieGuess,
+            user=user_content,
+            schema=_MovieGuess,
+            max_tokens=256,
         )
-    except anthropic.APIError as exc:
-        print(f"  ERROR: Anthropic request failed for '{folder_name}': {exc}")
+    except DeepSeekAuthError:
+        raise  # fatal, run-wide — abort instead of silently skipping every folder
+    except DeepSeekError as exc:
+        print(f"  ERROR: DeepSeek request failed for '{folder_name}': {exc}")
         return None
 
-    data = response.parsed_output
     title = (data.title or "").strip()
     year = data.year
     confidence = float(data.confidence or 0)
@@ -507,7 +544,7 @@ def _finalize(
 def process_folder(
     folder: Path,
     extensions: List[str],
-    anthropic_client: anthropic.Anthropic,
+    llm_client: DeepSeekClient,
     min_confidence: float,
     dest_root: Path,
     overwrite: bool,
@@ -524,6 +561,11 @@ def process_folder(
     if not video_files:
         return None, "no video files"
 
+    is_tv, tv_reason = looks_like_tv_disc(folder.name, video_files)
+    if is_tv:
+        print(f"  [TV   ] {tv_reason} — skipping movie ID, leaving for Sort_TV")
+        return None, TV_DISC_DEFER_REASON
+
     largest_file = max(video_files, key=lambda p: p.stat().st_size)
     extra_files = [f for f in video_files if f != largest_file]
     files_summary = format_files_for_prompt(video_files)
@@ -532,7 +574,7 @@ def process_folder(
     subtitle_text = get_subtitle_evidence(folder, largest_file, srt_max_lines)
     initial_evidence = subtitle_text  # may be None
 
-    guess = call_claude(anthropic_client, folder.name, files_summary, evidence_text=initial_evidence)
+    guess = call_llm(llm_client, folder.name, files_summary, evidence_text=initial_evidence)
     if not guess:
         return None, "LLM call failed"
 
@@ -594,7 +636,7 @@ def process_folder(
             evidence_parts.append("\n\n".join(audio_clips))
         combined_evidence = "\n\n".join(evidence_parts) or None
 
-        guess = call_claude(anthropic_client, folder.name, files_summary, evidence_text=combined_evidence)
+        guess = call_llm(llm_client, folder.name, files_summary, evidence_text=combined_evidence)
         if not guess:
             break
 
@@ -615,7 +657,7 @@ def process_folder(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Rename and move ripped movies using Claude, subtitle evidence, local Whisper, and TMDB."
+        description="Rename and move ripped movies using DeepSeek, subtitle evidence, local Whisper, and TMDB."
     )
     parser.add_argument("--source", type=Path, default=Path(r"D:\\Video"),
                         help="Source root containing ripped folders (default: D:\\Video)")
@@ -666,9 +708,9 @@ def main() -> None:
     args = parse_args()
 
     try:
-        api_key = os.environ["ANTHROPIC_API_KEY"]
+        api_key = os.environ["DEEPSEEK_API_KEY"]
     except KeyError:
-        print("ERROR: ANTHROPIC_API_KEY environment variable is not set.")
+        print("ERROR: DEEPSEEK_API_KEY environment variable is not set.")
         sys.exit(2)
 
     source_root: Path = args.source
@@ -680,7 +722,7 @@ def main() -> None:
         print(f"ERROR: Source root is not a directory: {source_root}")
         sys.exit(2)
 
-    anthropic_client = anthropic.Anthropic(api_key=api_key)
+    llm_client = DeepSeekClient(api_key=api_key)
 
     # ── Whisper setup ─────────────────────────────────────────────────────────
     whisper_model = None
@@ -768,7 +810,7 @@ def main() -> None:
         moved, reason = process_folder(
             folder=folder,
             extensions=extensions,
-            anthropic_client=anthropic_client,
+            llm_client=llm_client,
             min_confidence=args.min_confidence,
             dest_root=dest_root,
             overwrite=args.overwrite,
@@ -782,7 +824,7 @@ def main() -> None:
         )
         if moved:
             moved_movies.append(moved)
-        elif reason and reason != "no video files":
+        elif reason and reason not in ("no video files", TV_DISC_DEFER_REASON):
             skipped_folders.append({"folder": folder.name, "reason": reason})
         move_folder_to_processed(folder, processed_root, args.dry_run)
 
@@ -802,4 +844,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except DeepSeekAuthError as exc:
+        # Hard API failure (bad key / out of credits). Fail the build loudly so
+        # the Jenkins notification fires, rather than silently skipping folders
+        # and reporting SUCCESS.
+        print(f"FATAL: DeepSeek auth/billing failure — aborting run (no silent skips): {exc}")
+        sys.exit(1)

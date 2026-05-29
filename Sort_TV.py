@@ -12,11 +12,9 @@ Path 2 (LLM-assisted) + API verification:
 
 Requires:
 - ffprobe / ffmpeg on PATH (FFmpeg)
-- anthropic python package (pip install anthropic)
+- pydantic + requests python packages
 - faster-whisper python package (pip install faster-whisper) — only for audio transcription fallback
-- requests
-- ANTHROPIC_API_KEY env var set
-- OPENAI_API_KEY env var set (only required when --audio-fallback is enabled)
+- DEEPSEEK_API_KEY env var set
 - TMDB_API_KEY env var set (or pass --tmdb-api-key)
 
 TMDB endpoints used:
@@ -37,7 +35,6 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Any
 
-import anthropic
 import requests
 try:
     from faster_whisper import WhisperModel as _FasterWhisperModel
@@ -46,6 +43,8 @@ except ImportError:
     _FasterWhisperModel = None
     _FASTER_WHISPER_AVAILABLE = False
 from pydantic import BaseModel
+
+from llm_deepseek import DeepSeekClient, DeepSeekError, DeepSeekAuthError
 
 
 # ----------------------------
@@ -399,30 +398,25 @@ def transcribe_with_faster_whisper(model: "_FasterWhisperModel", wav_path: Path)
 # Parsing show/season from folder
 # ----------------------------
 
-def parse_show_and_season_with_llm(client: anthropic.Anthropic, folder_name: str) -> Tuple[Optional[str], Optional[int]]:
+def parse_show_and_season_with_llm(client: DeepSeekClient, folder_name: str) -> Tuple[Optional[str], Optional[int]]:
     class _ShowSeason(BaseModel):
         show: Optional[str] = None
         season: Optional[int] = None
 
     try:
-        resp = client.messages.parse(
-            model="claude-sonnet-4-5",
-            max_tokens=256,
+        result = client.parse(
             system="Return only the structured JSON object that matches the schema.",
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Extract the show name and season number from this folder name. "
-                    "Return only the JSON object.\n\n"
-                    f"Folder name: {folder_name}"
-                ),
-            }],
-            output_format=_ShowSeason,
+            user=(
+                "Extract the show name and season number from this folder name. "
+                "Return only the JSON object.\n\n"
+                f"Folder name: {folder_name}"
+            ),
+            schema=_ShowSeason,
+            max_tokens=256,
         )
     except Exception:
         return None, None
 
-    result = resp.parsed_output
     show = result.show
     season = result.season
 
@@ -619,7 +613,7 @@ Evidence text:
 
 
 def call_llm_identify(
-    client: anthropic.Anthropic,
+    client: DeepSeekClient,
     model: str,
     show: str,
     season: int,
@@ -644,15 +638,14 @@ def call_llm_identify(
                           episode_guide=episode_guide, disc_context=disc_context,
                           is_collection=is_collection, cross_disc_last_ep=cross_disc_last_ep)
 
-    resp = client.messages.parse(
+    result = client.parse(
+        system="Return only the structured JSON result matching the schema.",
+        user=prompt,
+        schema=_EpisodeID,
         model=model,
         max_tokens=1024,
-        system="Return only the structured JSON result matching the schema.",
-        messages=[{"role": "user", "content": prompt}],
-        output_format=_EpisodeID,
     )
 
-    result = resp.parsed_output
     return {
         "is_episode": result.is_episode,
         "show": result.show,
@@ -665,7 +658,7 @@ def call_llm_identify(
 
 
 def call_llm_identify_blind(
-    client: anthropic.Anthropic,
+    client: DeepSeekClient,
     model: str,
     evidence_text: str,
     duration_minutes: float,
@@ -685,15 +678,14 @@ def call_llm_identify_blind(
     prompt = build_blind_prompt(evidence_text, duration_minutes, evidence_kind,
                                disc_context=disc_context)
 
-    resp = client.messages.parse(
+    result = client.parse(
+        system="Return only the structured JSON result matching the schema.",
+        user=prompt,
+        schema=_EpisodeIDBlind,
         model=model,
         max_tokens=1024,
-        system="Return only the structured JSON result matching the schema.",
-        messages=[{"role": "user", "content": prompt}],
-        output_format=_EpisodeIDBlind,
     )
 
-    result = resp.parsed_output
     return {
         "is_episode": result.is_episode,
         "show": result.show,
@@ -977,9 +969,9 @@ def main():
     ap.add_argument("--dest", default=None,
                     help="Library root to move identified episodes into (e.g. /mnt/media/Media/Shows). "
                          "Creates <Show>/Season NN/ subdirs as needed. Omit to rename files in place.")
-    ap.add_argument("--model", default="claude-sonnet-4-5", help="Anthropic model for episode identification when folder/season is known (default: claude-sonnet-4-5)")
-    ap.add_argument("--blind-model", default="claude-sonnet-4-5", help="Anthropic model for blind identification (no folder hint; default: claude-sonnet-4-5)")
-    ap.add_argument("--min-minutes", type=float, default=7.0, help="Skip files shorter than this (default: 7)")
+    ap.add_argument("--model", default="deepseek-chat", help="DeepSeek model for episode identification when folder/season is known (default: deepseek-chat)")
+    ap.add_argument("--blind-model", default="deepseek-chat", help="DeepSeek model for blind identification (no folder hint; default: deepseek-chat)")
+    ap.add_argument("--min-minutes", type=float, default=6.0, help="Skip files shorter than this (default: 6). Low enough to keep short-form kids' episodes, e.g. Bluey (~7 min, often just under).")
     ap.add_argument("--max-minutes", type=float, default=100.0, help="Skip files longer than this (default: 100)")
     ap.add_argument("--min-confidence", type=float, default=0.85, help="Only consider LLM result when confidence >= this (default: 0.85)")
     ap.add_argument("--max-sub-lines", type=int, default=80, help="Subtitle lines to include (default: 80)")
@@ -1028,8 +1020,8 @@ def main():
         if verbose:
             print(msg)
 
-    if verbose and not os.environ.get("ANTHROPIC_API_KEY"):
-        vlog("[WARN ] ANTHROPIC_API_KEY is not set. LLM calls will fail.\n")
+    if verbose and not os.environ.get("DEEPSEEK_API_KEY"):
+        vlog("[WARN ] DEEPSEEK_API_KEY is not set. LLM calls will fail.\n")
 
     verify_api_enabled = (not args.no_verify_api)
     tmdb_key = args.tmdb_api_key or os.environ.get("TMDB_API_KEY") or ""
@@ -1042,7 +1034,7 @@ def main():
         else:
             tmdb_client = TmdbClient(api_key=tmdb_key)
 
-    anthropic_client = anthropic.Anthropic()
+    llm_client = DeepSeekClient()
 
     # Local faster-whisper model for audio transcription fallback
     whisper_model = None
@@ -1182,10 +1174,10 @@ def main():
             vlog(f"[HINT ] sort_hints.json: show={show!r} season={season} skip_tmdb={hints_skip_tmdb}")
         else:
             hints_skip_tmdb = False
-            vlog(f"[PARSE] Claude parsing folder name: \"{folder}\"")
-            show, season = parse_show_and_season_with_llm(anthropic_client, folder)
+            vlog(f"[PARSE] LLM parsing folder name: \"{folder}\"")
+            show, season = parse_show_and_season_with_llm(llm_client, folder)
             if not show or not season:
-                vlog("[PARSE] Claude parse missing fields; falling back to regex parsing.")
+                vlog("[PARSE] LLM parse missing fields; falling back to regex parsing.")
                 show, season = parse_show_and_season_from_folder(folder)
             folder_parse_failed = not show or not season
             if folder_parse_failed:
@@ -1414,12 +1406,14 @@ def main():
             nonlocal errors
             try:
                 result = call_llm_identify(
-                    anthropic_client, args.model, show, season, e_text, dur_m, e_kind,
+                    llm_client, args.model, show, season, e_text, dur_m, e_kind,
                     episode_guide=episode_guide,
                     disc_context=list(disc_context_list) or None,
                     is_collection=hints_skip_tmdb,
                     cross_disc_last_ep=_cross_disc_last,
                 )
+            except DeepSeekAuthError:
+                raise  # fatal, run-wide — abort instead of silently skipping
             except Exception as e:
                 errors += 1
                 print(f"[ERR  ] LLM call failed ({stage}): {e}")
@@ -1510,8 +1504,10 @@ def main():
             def attempt_llm_with_evidence(stage: str, e_text: str, e_kind: str) -> Tuple[bool, Optional[dict], str]:  # noqa: F811
                 nonlocal errors, renamed_blind
                 try:
-                    result = call_llm_identify_blind(anthropic_client, args.blind_model, e_text, dur_m, e_kind,
+                    result = call_llm_identify_blind(llm_client, args.blind_model, e_text, dur_m, e_kind,
                                                     disc_context=list(disc_context_list) or None)
+                except DeepSeekAuthError:
+                    raise  # fatal, run-wide — abort instead of silently skipping
                 except Exception as e:
                     errors += 1
                     print(f"[ERR  ] Blind LLM call failed ({stage}): {e}")
@@ -1915,4 +1911,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    try:
+        main()
+    except DeepSeekAuthError as e:
+        # Hard API failure (bad key / out of credits). Fail the build loudly so
+        # the Jenkins notification fires, rather than silently leaving files
+        # unsorted and reporting SUCCESS.
+        print(f"[FATAL] DeepSeek auth/billing failure — aborting run (no silent skips): {e}")
+        sys.exit(1)
