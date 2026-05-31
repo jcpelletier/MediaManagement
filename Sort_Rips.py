@@ -129,14 +129,35 @@ def looks_like_tv_disc(folder_name: str, video_files: List[Path]) -> Tuple[bool,
 
     # Structural signal: several similarly-sized titles => episodic disc.
     # A movie's main feature dominates total size; episodes are each ~1/N.
-    sizes = sorted((f.stat().st_size for f in video_files), reverse=True)
-    if len(sizes) >= 4:
-        largest = sizes[0]
-        if largest > 0:
-            similar = sum(1 for s in sizes if s >= 0.7 * largest)
-            if similar >= 4:
-                return True, f"{similar} similarly-sized titles suggest an episodic disc"
-    return False, ""
+    sized = sorted(
+        ((f, f.stat().st_size) for f in video_files),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    if len(sized) < 4:
+        return False, ""
+    largest = sized[0][1]
+    if largest <= 0:
+        return False, ""
+    similar = [(f, s) for f, s in sized if s >= 0.7 * largest]
+    if len(similar) < 4:
+        return False, ""
+
+    # Disambiguate via duration: many movie discs (esp. Disney/Pixar) expose
+    # the same feature as multiple large playlists — alternate audio mixes or
+    # language variants — and MakeMKV rips each as its own title. Those share
+    # a feature-length duration (>=75 min). TV episodes cluster at 20-60 min,
+    # so the median duration tells them apart when sizes alone look episodic.
+    durations = []
+    for f, _ in similar:
+        d = ffprobe_duration_seconds(f)
+        if d is not None and d > 0:
+            durations.append(d)
+    if durations:
+        median = sorted(durations)[len(durations) // 2]
+        if median >= 75 * 60:
+            return False, ""
+    return True, f"{len(similar)} similarly-sized titles suggest an episodic disc"
 
 
 # ─── subtitle extraction ─────────────────────────────────────────────────────
