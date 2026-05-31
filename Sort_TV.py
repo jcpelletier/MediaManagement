@@ -398,18 +398,35 @@ def transcribe_with_faster_whisper(model: "_FasterWhisperModel", wav_path: Path)
 # Parsing show/season from folder
 # ----------------------------
 
+_DISC_MARKER_RE = re.compile(
+    r"(?:^|(?<=[\s._-]))(?:disc[\s._-]*\d+|d\d+)(?=$|[\s._-])",
+    re.IGNORECASE,
+)
+
+
+def _strip_disc_markers(folder_name: str) -> str:
+    """Remove 'Disc N' / 'D<N>' tokens. They identify the physical disc, not the
+    season — without stripping, the LLM mistakes 'ARRESTED_D2' for season 2."""
+    cleaned = _DISC_MARKER_RE.sub(" ", folder_name)
+    return re.sub(r"[\s._-]+", " ", cleaned).strip(" ._-")
+
+
 def parse_show_and_season_with_llm(client: DeepSeekClient, folder_name: str) -> Tuple[Optional[str], Optional[int]]:
     class _ShowSeason(BaseModel):
         show: Optional[str] = None
         season: Optional[int] = None
+
+    cleaned = _strip_disc_markers(folder_name)
 
     try:
         result = client.parse(
             system="Return only the structured JSON object that matches the schema.",
             user=(
                 "Extract the show name and season number from this folder name. "
-                "Return only the JSON object.\n\n"
-                f"Folder name: {folder_name}"
+                "Disc markers ('Disc 2', 'D2', 'D3', etc.) identify the physical disc "
+                "and are NOT season numbers — ignore them. Return season=null if the "
+                "folder name does not state a season. Return only the JSON object.\n\n"
+                f"Folder name: {cleaned}"
             ),
             schema=_ShowSeason,
             max_tokens=256,
@@ -432,7 +449,7 @@ def parse_show_and_season_with_llm(client: DeepSeekClient, folder_name: str) -> 
 
 
 def parse_show_and_season_from_folder(folder_name: str) -> Tuple[Optional[str], Optional[int]]:
-    name = folder_name.strip()
+    name = _strip_disc_markers(folder_name)
     name = re.sub(r"[_]+", " ", name)
     name = re.sub(r"\s*-\s*", " - ", name)
     name = re.sub(r"\s+", " ", name)
