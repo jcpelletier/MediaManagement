@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import struct
 import tempfile
+import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -893,11 +894,35 @@ class TmdbClient:
         url = f"{self.base}{path}"
         params = dict(params or {})
         params["api_key"] = self.api_key
-        r = requests.get(url, params=params, timeout=self.timeout_s)
-        if r.status_code == 404:
-            return {}   # treat as "not found" rather than raising
-        r.raise_for_status()
-        return r.json()
+        # Retry transient network failures / 5xx with exponential backoff. A
+        # single api.themoviedb.org blip used to drop the affected file
+        # entirely; now we try four times before giving up.
+        last_exc: Optional[Exception] = None
+        for attempt in range(4):
+            try:
+                r = requests.get(url, params=params, timeout=self.timeout_s)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_exc = e
+                time.sleep(min(8.0, 0.5 * (2 ** attempt)))
+                continue
+            if r.status_code == 404:
+                return {}
+            if r.status_code >= 500 or r.status_code == 429:
+                last_exc = requests.HTTPError(f"TMDB returned {r.status_code}")
+                # 429 honours Retry-After when present, else exponential backoff.
+                retry_after = 0.0
+                if r.status_code == 429:
+                    try:
+                        retry_after = float(r.headers.get("Retry-After", "0"))
+                    except ValueError:
+                        retry_after = 0.0
+                time.sleep(max(retry_after, min(8.0, 0.5 * (2 ** attempt))))
+                continue
+            r.raise_for_status()
+            return r.json()
+        if last_exc is not None:
+            raise last_exc
+        return {}
 
     def find_tv(self, show_name: str) -> Optional[TmdbShow]:
         key = norm_title(show_name)
@@ -1363,6 +1388,178 @@ def main():
     # second pass once their folder gains auto-written hints from later files.
     retry_candidates: List[Dict[str, Any]] = []
 
+    # Phase 2 reconciliation state. Phase 1 used to call rename_and_move
+    # immediately; now it queues entries here and a folder-boundary flush
+    # reconciles them against contiguousness + TMDB runtime range before
+    # actually moving anything. Each pending entry carries the Phase 1
+    # proposal plus enough metadata for the reconciler to override it.
+    folder_pending: Dict[str, List[Dict[str, Any]]] = {}
+    folder_show_season: Dict[str, Tuple[str, int]] = {}
+
+    def _queue_for_reconcile(folder_key: str, mkv_path: Path, show_name: str,
+                              season_num: int, ep_num: int, ep_title: str,
+                              llm_conf: float, dur_minutes: Optional[float],
+                              tmdb_clean: bool, is_blind: bool = False) -> None:
+        folder_pending.setdefault(folder_key, []).append({
+            "mkv": mkv_path,
+            "show": show_name,
+            "season": season_num,
+            "proposed_ep": ep_num,
+            "proposed_title": ep_title,
+            "confidence": llm_conf,
+            "dur_m": dur_minutes,
+            "tmdb_confirmed_clean": tmdb_clean,
+            "is_blind": is_blind,
+        })
+        # Remember the canonical (show, season) for the folder so the
+        # reconciler can fetch the right TMDB episode list. First-write wins
+        # because later files in the same folder always share the season.
+        folder_show_season.setdefault(folder_key, (show_name, season_num))
+
+    def _flush_folder(folder_key: str) -> None:
+        """Reconcile Phase 1 proposals for a folder against contiguousness
+        and TMDB runtime range, then actually rename. Per the design:
+        - runtime outliers move to Extras (TMDB season [min, max] ± 20%)
+        - the remaining files in disc filename order are assumed contiguous
+          in episode number; the starting offset is found by anchor agreement
+        - contiguousness beats individual high-confidence Phase 1 answers"""
+        nonlocal renamed, dryrun, renamed_blind, skipped_target_exists, errors
+        pending = folder_pending.pop(folder_key, [])
+        if not pending:
+            return
+        show, season = folder_show_season.pop(folder_key, (pending[0]["show"], pending[0]["season"]))
+
+        # Pull TMDB episode list for runtime range + title lookup on override.
+        tmdb_eps: List[TmdbEpisode] = []
+        if tmdb_client is not None:
+            try:
+                tv_id = tmdb_client.find_tv_id(show)
+                if tv_id:
+                    tmdb_eps = tmdb_client.get_season_episodes(tv_id, season) or []
+            except Exception as e:
+                if verbose:
+                    print(f"[RECONCILE] TMDB season fetch failed for {show!r} S{season:02d}: {e}")
+
+        runtimes = [e.runtime for e in tmdb_eps if e.runtime]
+        if runtimes:
+            r_min = min(runtimes) * 0.8
+            r_max = max(runtimes) * 1.2
+        else:
+            r_min = r_max = None
+
+        episode_entries: List[Dict[str, Any]] = []
+        for entry in pending:
+            d = entry["dur_m"]
+            if r_min is not None and r_max is not None and d is not None and (d < r_min or d > r_max):
+                if verbose:
+                    print(f"[EXTRA-RANGE] {entry['mkv'].name} {d:.1f}m outside season runtime "
+                          f"range [{r_min:.1f}, {r_max:.1f}]m -> Extras")
+                extras_queue.append((entry["mkv"], show, season))
+                # Also free its claim so we don't block a future legitimate ID.
+                claim = (show.lower(), season, entry["proposed_ep"])
+                if episode_claims.get(claim) == entry["mkv"]:
+                    episode_claims.pop(claim, None)
+            else:
+                episode_entries.append(entry)
+
+        if not episode_entries:
+            return
+
+        episode_entries.sort(key=lambda e: e["mkv"].name)
+        proposed = [e["proposed_ep"] for e in episode_entries]
+        n = len(episode_entries)
+
+        # Anchors: Phase 1 entries we trust enough to pin the offset. We accept
+        # any conf >= 0.85; TMDB-confirmed-without-correction is given extra
+        # weight inside the score function below.
+        anchors_idx = [i for i, e in enumerate(episode_entries)
+                       if e["confidence"] >= 0.85]
+        if not anchors_idx:
+            print(f"[RECONCILE] folder {folder_key!r}: no high-confidence anchor — "
+                  f"refusing to guess offset, files left in place")
+            return
+
+        # Search every plausible starting episode and score how well it
+        # agrees with anchors + runtimes.
+        max_canon = max((e.episode_number for e in tmdb_eps), default=0) or (max(proposed) + n)
+        search_lo = 1
+        search_hi = max(1, max_canon - n + 1)
+
+        def _score(start: int) -> Tuple[int, float]:
+            anchor_score = 0
+            runtime_bonus = 0.0
+            for i, entry in enumerate(episode_entries):
+                expected = start + i
+                if expected == entry["proposed_ep"]:
+                    pts = int(round(entry["confidence"] * 100))
+                    if entry.get("tmdb_confirmed_clean"):
+                        pts += 20  # extra weight for TMDB-clean confirmations
+                    anchor_score += pts
+                if tmdb_eps and entry["dur_m"] is not None:
+                    ep_obj = next((x for x in tmdb_eps if x.episode_number == expected), None)
+                    if ep_obj and ep_obj.runtime and abs(ep_obj.runtime - entry["dur_m"]) <= 3.0:
+                        runtime_bonus += 5.0
+            return anchor_score, runtime_bonus
+
+        best_start = None
+        best_score = (-1, -1.0)
+        for start in range(search_lo, search_hi + 1):
+            s = _score(start)
+            if s > best_score:
+                best_score = s
+                best_start = start
+
+        if best_start is None:
+            print(f"[RECONCILE] folder {folder_key!r}: no plausible offset, files left in place")
+            return
+
+        anchor_pts, runtime_pts = best_score
+        print(f"[RECONCILE] folder {folder_key!r}: best offset E{best_start:02d} "
+              f"(anchor_score={anchor_pts} runtime_bonus={runtime_pts:.0f}, {n} file(s))")
+
+        # Drop stale claims from Phase 1 for this (show, season) — about to
+        # rebuild them from the reconciled assignments.
+        stale = [k for k in episode_claims
+                 if k[0] == show.lower() and k[1] == season]
+        for k in stale:
+            episode_claims.pop(k, None)
+
+        for i, entry in enumerate(episode_entries):
+            assigned_ep = best_start + i
+            assigned_title = entry["proposed_title"]
+            ep_obj = next((x for x in tmdb_eps if x.episode_number == assigned_ep), None)
+            if ep_obj:
+                assigned_title = ep_obj.name
+
+            if assigned_ep != entry["proposed_ep"]:
+                print(f"[OVERRIDE] {entry['mkv'].name}: Phase 1 said "
+                      f"S{season:02d}E{entry['proposed_ep']:02d} \"{entry['proposed_title']}\" "
+                      f"-> reconciled to S{season:02d}E{assigned_ep:02d} \"{assigned_title}\" "
+                      f"(order)")
+
+            ok = rename_and_move(entry["mkv"], show, season, assigned_ep,
+                                 assigned_title, args.dry_run, dest_root)
+            if ok:
+                claim = (show.lower(), season, assigned_ep)
+                episode_claims[claim] = entry["mkv"]
+                disc_context_list.append(f"S{season:02d}E{assigned_ep:02d} \"{assigned_title}\"")
+                renamed_episodes.append(
+                    f"{sanitize_filename(show)} - S{season:02d}E{assigned_ep:02d} - {sanitize_filename(assigned_title)}"
+                )
+                sk = (norm_title(show), season)
+                show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), assigned_ep)
+                if args.dry_run:
+                    dryrun += 1
+                else:
+                    renamed += 1
+                    if entry.get("is_blind"):
+                        renamed_blind += 1
+                print(f"[DONE ] renamed (reconciled)")
+            else:
+                skipped_target_exists += 1
+                print(f"[SKIP ] target exists / rename not performed: "
+                      f"S{season:02d}E{assigned_ep:02d}")
+
     for mkv in mkvs:
         total += 1
 
@@ -1435,8 +1632,11 @@ def main():
                     print(f"[API  ] TMDB canonical show -> \"{tmdb_show.name}\"")
                 show = tmdb_show.name
 
-        # Reset disc context when we move to a new folder
+        # Folder boundary: flush the previous folder's Phase 1 proposals
+        # through the reconciler, then reset per-folder state.
         if folder != _current_folder:
+            if _current_folder is not None:
+                _flush_folder(_current_folder)
             _current_folder = folder
             disc_context_list = []
 
@@ -1733,16 +1933,17 @@ def main():
                 return False, result, "conflict"
             episode_claims[claim_key] = mkv
 
-            ok = rename_and_move(mkv, show, season, final_ep_num, final_title, args.dry_run, dest_root)
-            if ok:
-                disc_context_list.append(f"S{season:02d}E{final_ep_num:02d} \"{final_title}\"")
-                renamed_episodes.append(f"{sanitize_filename(show)} - S{season:02d}E{final_ep_num:02d} - {sanitize_filename(final_title)}")
-                sk = (norm_title(show), season)
-                show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
-                _maybe_write_folder_hints(folder, mkv.parent, show, season, mkv.name,
-                                          tmdb_confirmed_clean, conf)
-                return True, result, "renamed"
-            return False, result, "target_exists"
+            # Queue for Phase 2 reconciliation instead of renaming now. The
+            # reconciler at the folder boundary may override final_ep_num /
+            # final_title before the actual move.
+            _queue_for_reconcile(folder, mkv, show, season, final_ep_num,
+                                  final_title, conf, dur_m, tmdb_confirmed_clean)
+            disc_context_list.append(f"S{season:02d}E{final_ep_num:02d} \"{final_title}\"")
+            sk = (norm_title(show), season)
+            show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
+            _maybe_write_folder_hints(folder, mkv.parent, show, season, mkv.name,
+                                      tmdb_confirmed_clean, conf)
+            return True, result, "queued"
 
         if folder_parse_failed:
             # Blind mode: redefine attempt_llm_with_evidence to identify show+season+episode
@@ -1851,27 +2052,20 @@ def main():
                     return False, result, "conflict"
                 episode_claims[claim_key] = mkv
 
-                ok = rename_and_move(mkv, final_show, final_season, final_ep_num, final_title, args.dry_run, dest_root)
-                if ok:
-                    disc_context_list.append(f"{final_show} S{final_season:02d}E{final_ep_num:02d} \"{final_title}\"")
-                    renamed_episodes.append(f"{sanitize_filename(final_show)} - S{final_season:02d}E{final_ep_num:02d} - {sanitize_filename(final_title)}")
-                    sk = (norm_title(final_show), final_season)
-                    show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
-                    if not args.dry_run:
-                        renamed_blind += 1
-                    _maybe_write_folder_hints(folder, mkv.parent, final_show, final_season,
-                                              mkv.name, tmdb_confirmed_clean, conf)
-                    return True, result, "renamed"
-                return False, result, "target_exists"
+                _queue_for_reconcile(folder, mkv, final_show, final_season, final_ep_num,
+                                      final_title, conf, dur_m, tmdb_confirmed_clean,
+                                      is_blind=True)
+                disc_context_list.append(f"{final_show} S{final_season:02d}E{final_ep_num:02d} \"{final_title}\"")
+                sk = (norm_title(final_show), final_season)
+                show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
+                _maybe_write_folder_hints(folder, mkv.parent, final_show, final_season,
+                                          mkv.name, tmdb_confirmed_clean, conf)
+                return True, result, "queued"
 
         renamed_ok, first_result, fail_code = attempt_llm_with_evidence("PRIMARY", evidence_text, evidence_kind)
 
         if renamed_ok:
-            print("[DONE ] renamed" + (" (blind)" if folder_parse_failed else ""))
-            if args.dry_run:
-                dryrun += 1
-            else:
-                renamed += 1
+            print("[QUEUE] held for folder reconciliation" + (" (blind)" if folder_parse_failed else ""))
             continue
 
         # Conflict: subtitle identified an already-claimed episode — retry with audio
@@ -1884,11 +2078,7 @@ def main():
                 conflict_kind = f"audio transcript (Whisper, conflict-retry {PRIMARY_AUDIO_SECONDS:.0f}s @ {audio_start:.0f}s)"
                 renamed_ok, first_result, fail_code = attempt_llm_with_evidence("CONFLICT-AUDIO", audio_tx, conflict_kind)
                 if renamed_ok:
-                    print("[DONE ] renamed (after conflict audio retry)")
-                    if args.dry_run:
-                        dryrun += 1
-                    else:
-                        renamed += 1
+                    print("[QUEUE] held for folder reconciliation (after conflict audio retry)")
                     continue
             else:
                 if verbose:
@@ -1922,11 +2112,7 @@ def main():
                     "SUBTITLE+AUDIO", combined_ev, combined_kind
                 )
                 if renamed_ok2:
-                    print("[DONE ] renamed (after subtitle+audio fallback)")
-                    if args.dry_run:
-                        dryrun += 1
-                    else:
-                        renamed += 1
+                    print("[QUEUE] held for folder reconciliation (after subtitle+audio fallback)")
                     continue
                 if second_result is not None:
                     first_result = second_result
@@ -1967,11 +2153,7 @@ def main():
                     combined_kind
                 )
                 if renamed_ok2:
-                    print("[DONE ] renamed (after combined fallback)")
-                    if args.dry_run:
-                        dryrun += 1
-                    else:
-                        renamed += 1
+                    print("[QUEUE] held for folder reconciliation (after combined fallback)")
                     continue
 
                 if second_result is not None:
@@ -2073,8 +2255,16 @@ def main():
             _queue_or_skip("TMDB could not verify episode")
             continue
 
+        # Catch-all for any fall-through that didn't queue or hit a labelled
+        # skip code (e.g. verify_error from an exception). Logged as
+        # "unresolved" so the reconciler's "target exists" stays unambiguous.
         skipped_target_exists += 1
-        print("[SKIP ] target exists / rename not performed")
+        print(f"[SKIP ] no rename queued (fail_code={fail_code!r})")
+
+    # Final folder flush: the loop ended without crossing one more folder
+    # boundary, so the last folder's pending entries still need reconciling.
+    if _current_folder is not None:
+        _flush_folder(_current_folder)
 
     # ----------------------------
     # Retry pass: re-attempt blind-mode skips for folders that gained hints
