@@ -1466,6 +1466,57 @@ def main():
             return
 
         episode_entries.sort(key=lambda e: e["mkv"].name)
+
+        # Drop Phase 1 outliers via median + MAD. A file whose proposed
+        # episode sits far outside the rest of the folder's proposals is
+        # almost certainly an alt-cut, commentary track, or otherwise extra
+        # whose content fooled the LLM into a different-season slot. Keeping
+        # it in pending forces the offset search to fit it, which can shift
+        # the rest of the folder off by one and drop the highest episode.
+        if len(episode_entries) >= 4:
+            props_for_med = sorted(e["proposed_ep"] for e in episode_entries)
+            mid = len(props_for_med) // 2
+            median_prop = props_for_med[mid]
+            mad_sorted = sorted(abs(e["proposed_ep"] - median_prop) for e in episode_entries)
+            mad = mad_sorted[mid]
+            if mad > 0:
+                kept_entries: List[Dict[str, Any]] = []
+                for entry in episode_entries:
+                    mod_z = abs(entry["proposed_ep"] - median_prop) / (1.4826 * mad)
+                    if mod_z > 3.5:
+                        print(f"[EXTRA-OUTLIER] {entry['mkv'].name} Phase 1 said "
+                              f"S{season:02d}E{entry['proposed_ep']:02d} — far from "
+                              f"folder median E{median_prop:02d}, routing to Extras")
+                        extras_queue.append((entry["mkv"], show, season))
+                        claim = (show.lower(), season, entry["proposed_ep"])
+                        if episode_claims.get(claim) == entry["mkv"]:
+                            episode_claims.pop(claim, None)
+                    else:
+                        kept_entries.append(entry)
+                episode_entries = kept_entries
+
+        if not episode_entries:
+            return
+
+        # Shortcut: if Phase 1's IDs (after outlier removal) form a contiguous
+        # episode run when sorted, Phase 1 is internally self-consistent — the
+        # LLM correctly identified the set of episodes, even if disc filename
+        # order doesn't match episode order. Trust Phase 1's per-file
+        # assignments directly without overriding via the file-order offset
+        # search. The offset-search override is reserved for the case where
+        # Phase 1 is scattered and file order is the only signal we have.
+        if len(episode_entries) >= 2:
+            sorted_proposed = sorted(e["proposed_ep"] for e in episode_entries)
+            if sorted_proposed[-1] - sorted_proposed[0] == len(sorted_proposed) - 1 \
+                    and all(e["confidence"] >= 0.85 for e in episode_entries):
+                print(f"[RECONCILE] folder {folder_key!r}: Phase 1 IDs form contiguous "
+                      f"run E{sorted_proposed[0]:02d}-E{sorted_proposed[-1]:02d} — "
+                      f"trusting per-file assignments without file-order override")
+                _apply_reconciled_renames(folder_key, show, season, episode_entries,
+                                          [e["proposed_ep"] for e in episode_entries],
+                                          tmdb_eps)
+                return
+
         proposed = [e["proposed_ep"] for e in episode_entries]
         n = len(episode_entries)
 
@@ -1517,15 +1568,22 @@ def main():
         print(f"[RECONCILE] folder {folder_key!r}: best offset E{best_start:02d} "
               f"(anchor_score={anchor_pts} runtime_bonus={runtime_pts:.0f}, {n} file(s))")
 
-        # Drop stale claims from Phase 1 for this (show, season) — about to
+        _apply_reconciled_renames(folder_key, show, season, episode_entries,
+                                  [best_start + i for i in range(n)], tmdb_eps)
+
+    def _apply_reconciled_renames(folder_key: str, show: str, season: int,
+                                   entries: List[Dict[str, Any]],
+                                   assigned_eps: List[int],
+                                   tmdb_eps: List[TmdbEpisode]) -> None:
+        nonlocal renamed, dryrun, renamed_blind, skipped_target_exists
+        # Drop stale claims from Phase 1 for this (show, season) before we
         # rebuild them from the reconciled assignments.
         stale = [k for k in episode_claims
                  if k[0] == show.lower() and k[1] == season]
         for k in stale:
             episode_claims.pop(k, None)
 
-        for i, entry in enumerate(episode_entries):
-            assigned_ep = best_start + i
+        for entry, assigned_ep in zip(entries, assigned_eps):
             assigned_title = entry["proposed_title"]
             ep_obj = next((x for x in tmdb_eps if x.episode_number == assigned_ep), None)
             if ep_obj:
