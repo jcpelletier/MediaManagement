@@ -71,7 +71,7 @@ Movies/
       bonus_feature.mkv        ← any other video files from the source folder
 ```
 
-- TV show folders are correctly skipped — TMDB movie search rejects them, and they pass through to `Sort_TV.py` via the Processed directory.
+- TV show folders are correctly skipped — a TV-disc heuristic (folder name markers like `Season`/`SxxExx`, or several similarly-sized titles with episode-length median runtime) defers them to `Sort_TV.py` without sending them through TMDB's movie index. Disney/Pixar discs that expose the same feature as multiple large playlists are disambiguated by median duration (≥75 min → movie).
 - After processing, non-video leftovers (subtitles, nfo files, etc.) are moved to `--processed`. If all files were moved to the library the source folder is deleted.
 
 ### Sort_TV.py
@@ -95,7 +95,7 @@ python Sort_TV.py --root /mnt/media/Video/Processed [flags]
 | `--min-confidence` | `0.85` | Minimum LLM confidence to rename |
 | `--whisper-model` | `small` | faster-whisper model size |
 | `--whisper-device` | `cpu` | `cpu` or `cuda` |
-| `--audio-start-seconds` | `120` | Start offset for primary audio clip |
+| `--audio-start-seconds` | `300` | Start offset for primary audio clip (past most recurring intros). A small random jitter is added each call so episodes in a season don't all sample at the same intro timestamp. |
 | `--no-audio-fallback` | | Disable Whisper transcription fallback |
 | `--no-verify-api` | | Disable TMDB verification |
 | `--tmdb-min-title-match` | `0.78` | Minimum title similarity for TMDB confirm |
@@ -103,12 +103,18 @@ python Sort_TV.py --root /mnt/media/Video/Processed [flags]
 
 **Identification pipeline**
 
-1. Parse show + season from folder name via DeepSeek with regex fallback
-2. Fetch episode guide (titles, runtimes, synopses) from TMDB for LLM context
-3. Extract subtitle excerpt (sampled from beginning, 25%, and 50% of file)
-4. If no subtitles: Whisper audio transcription (primary clip → second clip → deep fallback)
-5. DeepSeek identifies episode against the episode guide; TMDB verifies/corrects
-6. Duplicate detection — if two files claim the same episode, the second retries with audio
+1. Parse show + season from folder name via DeepSeek with regex fallback. Disc markers (`Disc 2`, `D2`, etc.) are stripped before parsing so they aren't mistaken for season numbers.
+2. Fetch episode guide (titles, runtimes, synopses) from TMDB for LLM context. Previously-identified episode numbers from sibling discs in the same show/season are passed as a "previous disc ended at E{N}" hint.
+3. Extract subtitle excerpt sampled at three timeline positions, skipping the first 5 minutes to avoid recurring intros / cold-open narration dominating the LLM context.
+4. If no subtitles: Whisper audio transcription (primary clip → second clip → deep fallback). Sample start offset gets per-call random jitter to de-correlate samples across episodes that share intro timing.
+5. DeepSeek identifies episode against the episode guide; TMDB verifies/corrects.
+6. Per-folder reconciliation (Phase 2): proposals are queued and reconciled against contiguousness + TMDB runtime range at the folder boundary — outliers get rejected and retried.
+7. Duplicate detection — if two files claim the same episode, the second retries with audio.
+
+**Auto-written hints + sibling disc inheritance**
+
+- After two TMDB-clean, high-confidence (≥0.90) identifications agree on `(show, season)` within a folder, Sort_TV writes a `sort_hints.json` to that folder so the remaining files skip blind mode.
+- When a folder name has a disc marker (e.g. `ARRESTED_D2`), Sort_TV looks at sibling folders sharing the same base name (`ARRESTED_D1`, `ARRESTED_D3`, …); if their `sort_hints.json` files all agree on show + season, the current folder inherits them.
 
 **Handling compilation discs / kids specials not in TMDB**
 
