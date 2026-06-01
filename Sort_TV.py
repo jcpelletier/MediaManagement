@@ -55,7 +55,7 @@ from llm_deepseek import DeepSeekClient, DeepSeekError, DeepSeekAuthError
 PRIMARY_AUDIO_SECONDS = 240.0
 
 # Shift audio sampling to 2 minutes in (120 seconds).
-AUDIO_START_SECONDS_HARDCODED = 120.0
+AUDIO_START_SECONDS_HARDCODED = 300.0
 
 DEFAULT_FALLBACK_AUDIO_SECONDS = 600.0
 
@@ -292,11 +292,27 @@ def summarize_subtitle_streams(streams: list[dict]) -> str:
     return f"{len(streams)} stream(s) → {', '.join(codec_set)} ({lang_summary})"
 
 
+_SRT_TS_RE = re.compile(
+    r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})"
+)
+
+
+def _srt_ts_to_seconds(h: str, m: str, s: str, ms: str) -> float:
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+
+
 def extract_subtitle_excerpt(
     mkv_path: Path,
     max_lines: int = 80,
     max_chars: int = 4000,
+    skip_head_seconds: float = 300.0,
 ) -> Optional[str]:
+    """Sample dialogue from three points in the episode, skipping the first
+    `skip_head_seconds` of timeline. Recurring intros / opening narration live
+    in that window and tend to dominate Phase-1 identification — sampling past
+    it forces the LLM to disambiguate on episode-specific dialogue. Files
+    whose total runtime falls inside the skip window get sampled from the
+    start as a fallback (they're almost certainly extras anyway)."""
     streams = ffprobe_subtitle_streams(mkv_path)
     if streams and subtitles_are_bitmap_only(streams):
         return None
@@ -322,14 +338,32 @@ def extract_subtitle_excerpt(
         except Exception:
             txt = srt_path.read_text(encoding="latin-1", errors="ignore")
 
-        lines = []
+        # Parse SRT into (start_seconds, dialogue_text) cues so we can filter
+        # by timeline position rather than line index.
+        cues: List[Tuple[float, str]] = []
+        current_start: Optional[float] = None
+        current_buf: List[str] = []
+
+        def _flush():
+            if current_start is not None and current_buf:
+                text = " ".join(current_buf).strip()
+                if text:
+                    cues.append((current_start, text))
+
         for raw_line in txt.splitlines():
             line = raw_line.strip()
+            if not line:
+                _flush()
+                current_start = None
+                current_buf = []
+                continue
             if re.fullmatch(r"\d+", line):
                 continue
-            if "-->" in line:
-                continue
-            if not line:
+            ts = _SRT_TS_RE.match(line)
+            if ts:
+                _flush()
+                current_start = _srt_ts_to_seconds(ts.group(1), ts.group(2), ts.group(3), ts.group(4))
+                current_buf = []
                 continue
             line = re.sub(r"</?i>", "", line)
             line = re.sub(r"</?b>", "", line)
@@ -338,21 +372,36 @@ def extract_subtitle_excerpt(
             line = re.sub(r"^\[.*?\]\s*", "", line)
             line = re.sub(r"^\(.*?\)\s*", "", line)
             if line:
-                lines.append(line)
+                current_buf.append(line)
+        _flush()
 
-        if not lines:
+        if not cues:
             return None
 
-        # Sample from three positions so opening titles/recaps don't dominate.
-        # Each section gets max_lines//3 lines from: beginning, 25% in, 50% in.
-        n = len(lines)
+        filtered = [(t, dlg) for (t, dlg) in cues if t >= skip_head_seconds]
+        if not filtered:
+            # Whole file fits inside the skip window — fall back to all cues.
+            filtered = cues
+            head_skipped = False
+        else:
+            head_skipped = True
+
+        end_time = filtered[-1][0] if filtered else 0.0
+        start_time = filtered[0][0] if filtered else 0.0
+        span = max(1.0, end_time - start_time)
+
         per_section = max(1, max_lines // 3)
+        # Sample at 0% / 33% / 66% of the post-skip window so the three picks
+        # are well separated even on short files.
         sections = []
-        for label, start_frac in [("BEGINNING", 0.0), ("QUARTER", 0.25), ("MIDDLE", 0.50)]:
-            start = int(n * start_frac)
-            chunk = lines[start : start + per_section]
+        for label, frac in [("EARLY", 0.0), ("MID", 0.34), ("LATE", 0.67)]:
+            target_t = start_time + frac * span
+            # Find the first cue at or after target_t.
+            idx = next((i for i, (t, _) in enumerate(filtered) if t >= target_t), 0)
+            chunk = [dlg for _, dlg in filtered[idx : idx + per_section]]
             if chunk:
-                sections.append(f"[{label}]\n" + "\n".join(chunk))
+                tag = f"[{label}]" if head_skipped else f"[{label}*]"
+                sections.append(f"{tag}\n" + "\n".join(chunk))
 
         excerpt = "\n\n".join(sections)[:max_chars].strip()
         return excerpt if excerpt else None
@@ -478,6 +527,52 @@ def parse_show_and_season_from_folder(folder_name: str) -> Tuple[Optional[str], 
         show = re.sub(r"\s+", " ", show).strip()
 
     return show, season
+
+
+def find_sibling_disc_hints(folder_path: Path) -> Optional[dict]:
+    """Look for a sibling disc folder (e.g. ARRESTED_D2 -> ARRESTED_D1) with a
+    sort_hints.json and inherit its show/season. Only fires when the current
+    folder has a disc marker, so unrelated siblings are not consulted. If
+    multiple siblings have hints, all must agree on show + season."""
+    if not _DISC_MARKER_RE.search(folder_path.name):
+        return None
+    parent = folder_path.parent
+    if not parent.exists():
+        return None
+    base = _strip_disc_markers(folder_path.name).lower()
+    if not base:
+        return None
+
+    candidates: List[Tuple[str, int, str]] = []
+    try:
+        siblings = list(parent.iterdir())
+    except OSError:
+        return None
+    for sib in siblings:
+        if sib == folder_path or not sib.is_dir():
+            continue
+        if _strip_disc_markers(sib.name).lower() != base:
+            continue
+        hp = sib / "sort_hints.json"
+        if not hp.exists():
+            continue
+        try:
+            data = json.loads(hp.read_text())
+        except Exception:
+            continue
+        show = str(data.get("show", "")).strip()
+        season = data.get("season")
+        if show and isinstance(season, int) and season >= 1:
+            candidates.append((show, season, sib.name))
+
+    if not candidates:
+        return None
+    shows = {norm_title(s) for s, _, _ in candidates}
+    seasons = {se for _, se, _ in candidates}
+    if len(shows) != 1 or len(seasons) != 1:
+        return None
+    show, season, src = candidates[0]
+    return {"show": show, "season": season, "_inherited_from": src}
 
 
 def write_auto_sort_hints(folder_path: Path, show: str, season: int, source_file: str) -> bool:
@@ -1289,6 +1384,18 @@ def main():
             except Exception as e:
                 print(f"[WARN ] Could not read sort_hints.json in {folder}: {e}")
                 folder_hints_cache[folder] = {}
+            # Multi-disc box sets (ARRESTED_D1/D2/D3) usually share a season.
+            # If this folder has no own hints, inherit from a sibling disc that
+            # already has clean hints — manual or auto-written from an earlier
+            # disc in this same run. Stops D2/D3 from running blind and
+            # anchoring on the wrong season.
+            if not folder_hints_cache[folder]:
+                sib_hints = find_sibling_disc_hints(mkv.parent)
+                if sib_hints:
+                    folder_hints_cache[folder] = sib_hints
+                    folder_hints_written.add(folder)
+                    vlog(f"[HINT ] inherited from sibling disc {sib_hints['_inherited_from']!r}: "
+                         f"show={sib_hints['show']!r} season={sib_hints['season']}")
         hints = folder_hints_cache[folder]
         hints_show = str(hints.get("show", "")).strip()
         hints_season = hints.get("season")
