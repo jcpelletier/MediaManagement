@@ -25,6 +25,7 @@ TMDB endpoints used:
 import argparse
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -57,6 +58,13 @@ PRIMARY_AUDIO_SECONDS = 240.0
 AUDIO_START_SECONDS_HARDCODED = 120.0
 
 DEFAULT_FALLBACK_AUDIO_SECONDS = 600.0
+
+# Random jitter (seconds) added to every audio sampling start offset. Shows
+# in a season often share consistent intro/cold-open timings, so a fixed start
+# tends to land on the same intro across episodes; jitter de-correlates samples
+# so we capture episode-distinguishing dialog instead.
+AUDIO_START_JITTER_MIN = 2.0
+AUDIO_START_JITTER_MAX = 20.0
 
 INVALID_FILENAME_CHARS = r'<>:"/\\|?*'
 
@@ -472,6 +480,26 @@ def parse_show_and_season_from_folder(folder_name: str) -> Tuple[Optional[str], 
     return show, season
 
 
+def write_auto_sort_hints(folder_path: Path, show: str, season: int, source_file: str) -> bool:
+    """Persist a hint after a confident, TMDB-confirmed identification so the
+    rest of this folder (and future runs) skip blind mode. Refuses to overwrite
+    an existing hints file."""
+    hints_path = folder_path / "sort_hints.json"
+    if hints_path.exists():
+        return False
+    payload = {
+        "show": show,
+        "season": season,
+        "_auto": True,
+        "_source_file": source_file,
+    }
+    try:
+        hints_path.write_text(json.dumps(payload, indent=2))
+        return True
+    except Exception:
+        return False
+
+
 # ----------------------------
 # LLM: identify episode
 # ----------------------------
@@ -855,6 +883,22 @@ class VerificationResult:
     reason: str
 
 
+def _runtime_disagrees(
+    canon_runtime: Optional[int],
+    file_minutes: Optional[float],
+    max_relative: float = 0.30,
+    max_absolute: float = 15.0,
+) -> bool:
+    """Tolerance uses whichever is LARGER (relative or absolute) so commercial cuts,
+    pilots, and finales still match. Returns False (no signal) when either side
+    is missing — runtime can only reject, never falsely confirm."""
+    if canon_runtime is None or canon_runtime <= 0 or file_minutes is None:
+        return False
+    delta = abs(canon_runtime - file_minutes)
+    tolerance = max(max_absolute, canon_runtime * max_relative)
+    return delta > tolerance
+
+
 def verify_or_correct_with_tmdb(
     tmdb: TmdbClient,
     show: str,
@@ -862,6 +906,7 @@ def verify_or_correct_with_tmdb(
     proposed_ep_num: int,
     proposed_title: str,
     min_title_match: float,
+    file_duration_minutes: Optional[float] = None,
 ) -> VerificationResult:
     tv_id = tmdb.find_tv_id(show)
     if not tv_id:
@@ -885,13 +930,12 @@ def verify_or_correct_with_tmdb(
             reason="tmdb: season not found or has no episodes"
         )
 
-    # 1) If episode number exists, verify title similarity
+    # 1) If episode number exists, verify title similarity AND runtime.
     ep_by_num = {e.episode_number: e for e in episodes}
     if proposed_ep_num in ep_by_num:
         canon = ep_by_num[proposed_ep_num]
         score = similarity(proposed_title, canon.name)
-        if score >= min_title_match:
-            # Confirm (and optionally replace title with canonical)
+        if score >= min_title_match and not _runtime_disagrees(canon.runtime, file_duration_minutes):
             return VerificationResult(
                 ok=True,
                 corrected=(norm_title(proposed_title) != norm_title(canon.name)),
@@ -900,23 +944,48 @@ def verify_or_correct_with_tmdb(
                 match_score=score,
                 reason="tmdb: confirmed by episode number + title match"
             )
+        # Title matched but runtime way off — fall through to look for a better
+        # episode in this season whose runtime fits.
 
-    # 2) Otherwise match title across all episodes and pick best
-    best = None
-    best_score = 0.0
-    for e in episodes:
-        sc = similarity(proposed_title, e.name)
-        if sc > best_score:
-            best_score = sc
-            best = e
+    # 2) Score every episode by title similarity; use runtime as tiebreaker
+    #    when multiple episodes are close on title.
+    scored = sorted(
+        ((e, similarity(proposed_title, e.name)) for e in episodes),
+        key=lambda x: x[1],
+        reverse=True,
+    )
 
-    if best and best_score >= min_title_match:
-        corrected = (best.episode_number != proposed_ep_num) or (norm_title(best.name) != norm_title(proposed_title))
+    best_ep, best_score = (scored[0] if scored else (None, 0.0))
+
+    if best_ep and best_score >= min_title_match:
+        # Tiebreaker: among candidates within 0.05 of the top score and above
+        # threshold, prefer the one whose runtime is closest to the file.
+        if file_duration_minutes is not None:
+            tied = [(e, s) for e, s in scored
+                    if s >= min_title_match and s >= best_score - 0.05]
+            if len(tied) > 1:
+                def _runtime_dist(ep):
+                    return abs(ep.runtime - file_duration_minutes) if ep.runtime else float("inf")
+                tied.sort(key=lambda x: (_runtime_dist(x[0]), -x[1]))
+                best_ep, best_score = tied[0]
+
+        if _runtime_disagrees(best_ep.runtime, file_duration_minutes):
+            return VerificationResult(
+                ok=False,
+                corrected=False,
+                episode_number=None,
+                episode_title=None,
+                match_score=best_score,
+                reason=(f"tmdb: best title match S{season:02d}E{best_ep.episode_number:02d} "
+                        f"runtime {best_ep.runtime}min disagrees with file {file_duration_minutes:.1f}min"),
+            )
+
+        corrected = (best_ep.episode_number != proposed_ep_num) or (norm_title(best_ep.name) != norm_title(proposed_title))
         return VerificationResult(
             ok=True,
             corrected=corrected,
-            episode_number=best.episode_number,
-            episode_title=best.name,
+            episode_number=best_ep.episode_number,
+            episode_title=best_ep.name,
             match_score=best_score,
             reason="tmdb: corrected by title-to-season match"
         )
@@ -1150,6 +1219,42 @@ def main():
     # Per-folder sort_hints.json overrides (keyed by folder name).
     folder_hints_cache: Dict[str, dict] = {}
 
+    # Per-folder count of TMDB-clean identifications keyed by (folder, show, season).
+    # When any (show, season) reaches 2 confirmations in a folder, write
+    # sort_hints.json to that folder so the remaining files skip blind mode.
+    # Each folder is treated in isolation — no cross-folder inference.
+    folder_id_counts: Dict[Tuple[str, str, int], int] = {}
+    folder_hints_written: set = set()
+
+    def _maybe_write_folder_hints(folder_key: str, folder_path: Path, show_name: str,
+                                  season_num: int, src_name: str,
+                                  tmdb_clean: bool, llm_conf: float) -> None:
+        if not tmdb_clean or llm_conf < 0.90:
+            return
+        if folder_key in folder_hints_written:
+            return
+        if not show_name or not isinstance(season_num, int) or season_num < 1:
+            return
+        ck = (folder_key, norm_title(show_name), season_num)
+        folder_id_counts[ck] = folder_id_counts.get(ck, 0) + 1
+        if folder_id_counts[ck] < 2:
+            return
+        folder_hints_written.add(folder_key)
+        folder_hints_cache[folder_key] = {
+            "show": show_name,
+            "season": season_num,
+            "_auto": True,
+            "_source_file": src_name,
+        }
+        if args.dry_run:
+            if verbose:
+                print(f"[HINT ] DRYRUN would auto-write sort_hints.json after 2 confirmations "
+                      f"(show={show_name!r} season={season_num})")
+            return
+        if write_auto_sort_hints(folder_path, show_name, season_num, src_name) and verbose:
+            print(f"[HINT ] auto-wrote sort_hints.json after 2 confirmations "
+                  f"(show={show_name!r} season={season_num})")
+
     # Highest episode number identified so far per (show_key, season) across ALL disc folders.
     # Used to give the LLM a cross-disc "previous disc ended at E{N}" hint.
     show_season_last_ep: Dict[Tuple, int] = {}
@@ -1158,6 +1263,10 @@ def main():
     # Reset each time we move to a new parent folder.
     _current_folder: Optional[str] = None
     disc_context_list: List[str] = []
+
+    # Files skipped during blind-mode processing that may be salvageable in a
+    # second pass once their folder gains auto-written hints from later files.
+    retry_candidates: List[Dict[str, Any]] = []
 
     for mkv in mkvs:
         total += 1
@@ -1196,6 +1305,12 @@ def main():
             if not show or not season:
                 vlog("[PARSE] LLM parse missing fields; falling back to regex parsing.")
                 show, season = parse_show_and_season_from_folder(folder)
+            # Boxed-set discs ('ARRESTED_D1', 'Show Disc 2') almost always sit inside
+            # a single season — default to season 1 when we have a show but no season
+            # info. sort_hints.json overrides this for the rare multi-season set.
+            if show and not season and _DISC_MARKER_RE.search(folder):
+                vlog(f"[PARSE] Folder \"{folder}\" has disc marker but no season — defaulting season=1.")
+                season = 1
             folder_parse_failed = not show or not season
             if folder_parse_failed:
                 vlog(f"[PARSE] Folder \"{folder}\" yielded no show/season — will attempt blind identification from content.")
@@ -1315,13 +1430,15 @@ def main():
             return min(requested_start, latest_start)
 
         def attempt_audio_transcribe(seconds: float, stage: str, start_seconds: float) -> Tuple[Optional[str], Optional[float]]:
-            actual_start = clamp_clip_start(start_seconds, seconds)
+            jitter = random.uniform(AUDIO_START_JITTER_MIN, AUDIO_START_JITTER_MAX)
+            jittered_start = start_seconds + jitter
+            actual_start = clamp_clip_start(jittered_start, seconds)
             if actual_start is None:
                 if verbose:
                     print(f"[AUDIO] {stage} clip skipped (duration {seconds:.0f}s exceeds file length {dur_s:.0f}s)")
                 return None, None
             if verbose:
-                print(f"[AUDIO] {stage} clip attempt ({seconds:.0f}s @ {actual_start:.0f}s)")
+                print(f"[AUDIO] {stage} clip attempt ({seconds:.0f}s @ {actual_start:.0f}s, jitter +{jitter:.1f}s)")
             with tempfile.TemporaryDirectory() as td:
                 wav_path = Path(td) / "clip.wav"
                 ok = extract_audio_clip_wav(
@@ -1463,6 +1580,7 @@ def main():
 
             final_ep_num = ep_num
             final_title = ep_title
+            tmdb_confirmed_clean = False
 
             if verify_api_enabled and not hints_skip_tmdb and tmdb_client is not None:
                 try:
@@ -1473,6 +1591,7 @@ def main():
                         proposed_ep_num=ep_num,
                         proposed_title=ep_title,
                         min_title_match=float(args.tmdb_min_title_match),
+                        file_duration_minutes=dur_m,
                     )
                 except Exception as e:
                     errors += 1
@@ -1493,6 +1612,7 @@ def main():
 
                 final_ep_num = vres.episode_number
                 final_title = vres.episode_title
+                tmdb_confirmed_clean = not vres.corrected
             elif hints_skip_tmdb and verbose:
                 print(f"[HINT ] TMDB verify skipped (sort_hints.json skip_tmdb=true)")
 
@@ -1512,6 +1632,8 @@ def main():
                 renamed_episodes.append(f"{sanitize_filename(show)} - S{season:02d}E{final_ep_num:02d} - {sanitize_filename(final_title)}")
                 sk = (norm_title(show), season)
                 show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
+                _maybe_write_folder_hints(folder, mkv.parent, show, season, mkv.name,
+                                          tmdb_confirmed_clean, conf)
                 return True, result, "renamed"
             return False, result, "target_exists"
 
@@ -1559,6 +1681,7 @@ def main():
                 final_season = blind_season
                 final_ep_num = ep_num
                 final_title = ep_title
+                tmdb_confirmed_clean = False
 
                 if verify_api_enabled and tmdb_client is not None:
                     # Canonicalize show name first
@@ -1583,6 +1706,7 @@ def main():
                                 proposed_ep_num=ep_num,
                                 proposed_title=ep_title,
                                 min_title_match=float(args.tmdb_min_title_match),
+                                file_duration_minutes=dur_m,
                             )
                         except Exception as e:
                             errors += 1
@@ -1601,6 +1725,7 @@ def main():
 
                         final_ep_num = vres.episode_number
                         final_title = vres.episode_title
+                        tmdb_confirmed_clean = not vres.corrected
                     else:
                         # Show not found in TMDB — likely a standalone special, TV movie, or
                         # compilation content not catalogued as a TV series. Trust the LLM.
@@ -1627,6 +1752,8 @@ def main():
                     show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
                     if not args.dry_run:
                         renamed_blind += 1
+                    _maybe_write_folder_hints(folder, mkv.parent, final_show, final_season,
+                                              mkv.name, tmdb_confirmed_clean, conf)
                     return True, result, "renamed"
                 return False, result, "target_exists"
 
@@ -1786,6 +1913,21 @@ def main():
         if fail_code in ("llm_error", "verify_error"):
             continue
 
+        # Queue blind-mode skips for the end-of-run retry pass — later files in
+        # this folder may auto-write hints that let us identify this file in a
+        # second attempt using the TMDB episode guide.
+        if (folder_parse_failed
+                and evidence_text is not None
+                and fail_code in ("low_conf", "missing_fields", "verify_failed", "non_episode")):
+            retry_candidates.append({
+                "mkv": mkv,
+                "folder": folder,
+                "evidence_text": evidence_text,
+                "evidence_kind": evidence_kind,
+                "dur_m": dur_m,
+                "fail_code": fail_code,
+            })
+
         def _queue_or_skip(reason: str) -> None:
             """Add to extras_queue when dest+context available, else skipped_files."""
             if dest_root and show and season:
@@ -1827,11 +1969,150 @@ def main():
         skipped_target_exists += 1
         print("[SKIP ] target exists / rename not performed")
 
+    # ----------------------------
+    # Retry pass: re-attempt blind-mode skips for folders that gained hints
+    # mid-run. With (show, season) now known, the hinted prompt + TMDB episode
+    # guide can often identify content that was too ambiguous in blind mode.
+    # ----------------------------
+    retry_renamed_count = 0
+    retry_eligible = [c for c in retry_candidates if c["folder"] in folder_hints_written]
+    if retry_eligible:
+        hr()
+        print(f"\n=== RETRY PASS ({len(retry_eligible)} candidate(s)) ===")
+        for cand in retry_eligible:
+            mkv = cand["mkv"]
+            folder = cand["folder"]
+            fail_code = cand["fail_code"]
+            evidence_text = cand["evidence_text"]
+            evidence_kind = cand["evidence_kind"]
+            dur_m = cand["dur_m"]
+
+            if not mkv.exists():
+                continue
+
+            hints = folder_hints_cache.get(folder) or {}
+            show = str(hints.get("show", "")).strip()
+            season = hints.get("season")
+            if not show or not isinstance(season, int) or season < 1:
+                continue
+
+            hr()
+            print(f"RETRY: {short_path(mkv, 110)}")
+            print(f"HINT (auto): {show} | S{season:02d} | {dur_m:.1f}m | prior={fail_code}")
+
+            guide_key = (show.lower(), season)
+            episode_guide = episode_guide_cache.get(guide_key)
+            if episode_guide is None and tmdb_client is not None and verify_api_enabled:
+                try:
+                    tv_id = tmdb_client.find_tv_id(show)
+                    if tv_id:
+                        eps = tmdb_client.get_season_episodes(tv_id, season)
+                        episode_guide = format_episode_guide(eps, season, dur_m) if eps else None
+                        episode_guide_cache[guide_key] = episode_guide
+                except Exception:
+                    pass
+
+            cross_last = show_season_last_ep.get((norm_title(show), season))
+
+            try:
+                result = call_llm_identify(
+                    llm_client, args.model, show, season, evidence_text, dur_m, evidence_kind,
+                    episode_guide=episode_guide,
+                    disc_context=None,
+                    is_collection=False,
+                    cross_disc_last_ep=cross_last,
+                )
+            except Exception as e:
+                errors += 1
+                print(f"[ERR  ] retry LLM call failed: {e}")
+                continue
+
+            compact, _ = format_llm_compact(result, season, args.min_confidence)
+            print(f"[LLM  ] RETRY -> {compact}")
+
+            is_episode = bool(result.get("is_episode"))
+            conf = float(result.get("confidence", 0.0))
+            ep_num = result.get("episode_number")
+            ep_title = result.get("episode_title")
+
+            if not is_episode:
+                print("[SKIP ] retry: LLM still says non-episode")
+                continue
+            if conf < args.min_confidence:
+                print(f"[SKIP ] retry: confidence {conf:.2f} < {args.min_confidence:.2f}")
+                continue
+            if not isinstance(ep_num, int) or not ep_title:
+                print("[SKIP ] retry: missing episode_number or episode_title")
+                continue
+
+            final_ep_num = ep_num
+            final_title = ep_title
+
+            if verify_api_enabled and tmdb_client is not None:
+                try:
+                    vres = verify_or_correct_with_tmdb(
+                        tmdb=tmdb_client,
+                        show=show,
+                        season=season,
+                        proposed_ep_num=ep_num,
+                        proposed_title=ep_title,
+                        min_title_match=float(args.tmdb_min_title_match),
+                        file_duration_minutes=dur_m,
+                    )
+                except Exception as e:
+                    errors += 1
+                    print(f"[ERR  ] retry TMDB verify failed: {e}")
+                    continue
+
+                if not vres.ok or vres.episode_number is None or not vres.episode_title:
+                    print(f"[SKIP ] retry: TMDB reject ({vres.reason})")
+                    continue
+
+                tag = "corrected" if vres.corrected else "confirmed"
+                print(f"[API  ] retry TMDB {tag} -> S{season:02d}E{vres.episode_number:02d} \"{vres.episode_title}\" (match={vres.match_score:.2f})")
+                final_ep_num = vres.episode_number
+                final_title = vres.episode_title
+
+            claim_key = (show.lower(), season, final_ep_num)
+            if claim_key in episode_claims:
+                print(f"[SKIP ] retry: S{season:02d}E{final_ep_num:02d} already claimed by {episode_claims[claim_key].name}")
+                continue
+            episode_claims[claim_key] = mkv
+
+            ok = rename_and_move(mkv, show, season, final_ep_num, final_title, args.dry_run, dest_root)
+            if not ok:
+                print("[SKIP ] retry: target exists / rename not performed")
+                continue
+
+            print("[DONE ] renamed (retry pass)")
+            renamed_episodes.append(f"{sanitize_filename(show)} - S{season:02d}E{final_ep_num:02d} - {sanitize_filename(final_title)}")
+            sk = (norm_title(show), season)
+            show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
+            retry_renamed_count += 1
+            if args.dry_run:
+                dryrun += 1
+            else:
+                renamed += 1
+
+            # Rewind the original skip counter so the SUMMARY reflects the net outcome.
+            if fail_code == "low_conf":
+                skipped_low_conf = max(0, skipped_low_conf - 1)
+            elif fail_code == "missing_fields":
+                skipped_missing_fields = max(0, skipped_missing_fields - 1)
+            elif fail_code == "verify_failed":
+                skipped_verify_failed = max(0, skipped_verify_failed - 1)
+            elif fail_code == "non_episode":
+                skipped_non_episode = max(0, skipped_non_episode - 1)
+
+            extras_queue[:] = [(p, s, sn) for (p, s, sn) in extras_queue if p != mkv]
+            skipped_files[:] = [sf for sf in skipped_files if sf.get("file") != mkv.name]
+
     hr()
     print("\n=== SUMMARY ===")
     print(f"Total files scanned: {total}")
     print(f"Renamed:            {renamed}")
     print(f"  of which blind:   {renamed_blind}  (no folder hint — identified from content)")
+    print(f"  of which retry:   {retry_renamed_count}  (re-IDed after folder gained auto-hints)")
     print(f"Dry-run renames:    {dryrun}")
     print(f"Errors:             {errors}")
     print(f"Evidence used: subtitles={used_subtitles} audio_primary={used_audio_primary} audio_fallback={used_audio_fallback}")
