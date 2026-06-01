@@ -838,6 +838,65 @@ def call_llm_identify_blind(
     }
 
 
+def call_llm_synopsis_pick(
+    client: DeepSeekClient,
+    model: str,
+    evidence_text: str,
+    evidence_kind: str,
+    candidates: List[Tuple[int, str, str]],
+) -> Optional[int]:
+    """Given an evidence excerpt and a small set of candidate episodes with their
+    TMDB plot synopses, ask the LLM which candidate's synopsis best matches the
+    excerpt. Used as the sanity check after the reconciler's contiguous-run
+    shortcut: if the LLM systematically picks the episode-before / episode-after
+    the Phase 1 proposal, the whole disc was off by one and the shortcut needs
+    correcting. Returns the picked episode_number, or None if no candidate
+    plausibly matches."""
+    class _SynopsisPick(BaseModel):
+        episode_number: Optional[int] = None
+        reason: str = ""
+
+    if not candidates:
+        return None
+
+    candidate_block = "\n\n".join(
+        f"Episode {ep}: \"{title}\"\nSynopsis: {overview or '(no synopsis available)'}"
+        for ep, title, overview in candidates
+    )
+
+    prompt = (
+        "You are given an excerpt of dialogue or audio transcript from one TV "
+        "episode, and several candidate episodes with their plot synopses. Pick "
+        "the candidate whose synopsis is the best match for what is happening in "
+        "the excerpt. Match on specific plot beats, named characters, settings, "
+        "and events — not on the show's recurring style or general tone. If no "
+        "candidate's synopsis plausibly matches, return episode_number=null.\n\n"
+        f"EVIDENCE TYPE: {evidence_kind}\n\n"
+        f"EVIDENCE:\n\"\"\"\n{evidence_text}\n\"\"\"\n\n"
+        f"CANDIDATES:\n{candidate_block}\n\n"
+        "Return only the JSON object."
+    )
+
+    try:
+        result = client.parse(
+            system="Return only the structured JSON result matching the schema.",
+            user=prompt,
+            schema=_SynopsisPick,
+            model=model,
+            max_tokens=512,
+        )
+    except Exception:
+        return None
+
+    picked = result.episode_number
+    if not isinstance(picked, int):
+        return None
+    valid_eps = {ep for ep, _, _ in candidates}
+    if picked not in valid_eps:
+        return None
+    return picked
+
+
 def format_llm_compact(result: dict, season: int, min_conf: float) -> Tuple[str, bool]:
     is_episode = bool(result.get("is_episode"))
     conf = float(result.get("confidence", 0.0))
@@ -1399,7 +1458,9 @@ def main():
     def _queue_for_reconcile(folder_key: str, mkv_path: Path, show_name: str,
                               season_num: int, ep_num: int, ep_title: str,
                               llm_conf: float, dur_minutes: Optional[float],
-                              tmdb_clean: bool, is_blind: bool = False) -> None:
+                              tmdb_clean: bool, evidence_text: Optional[str] = None,
+                              evidence_kind: Optional[str] = None,
+                              is_blind: bool = False) -> None:
         folder_pending.setdefault(folder_key, []).append({
             "mkv": mkv_path,
             "show": show_name,
@@ -1409,12 +1470,101 @@ def main():
             "confidence": llm_conf,
             "dur_m": dur_minutes,
             "tmdb_confirmed_clean": tmdb_clean,
+            "evidence_text": evidence_text,
+            "evidence_kind": evidence_kind,
             "is_blind": is_blind,
         })
         # Remember the canonical (show, season) for the folder so the
         # reconciler can fetch the right TMDB episode list. First-write wins
         # because later files in the same folder always share the season.
         folder_show_season.setdefault(folder_key, (show_name, season_num))
+
+    def _synopsis_consensus_shift(
+        folder_key: str,
+        entries: List[Dict[str, Any]],
+        tmdb_eps: List[TmdbEpisode],
+        max_canon: int,
+    ) -> Any:
+        """For each file in a contiguous-run shortcut candidate, ask the LLM
+        which of the nearby episodes (proposed ± 2) best matches the file's
+        evidence based on plot synopses. Each file's pick votes for a shift
+        relative to its Phase 1 proposed episode. Returns:
+          - None if the check cannot run (no synopses, no evidence retained)
+          - "refuse" if the LLM broadly rejects nearby candidates (Phase 1 is
+            wrong in a way a simple shift can't fix)
+          - int (negative, zero, positive) shift to apply when a majority of
+            files agree on a single shift
+        Ambiguous votes (no majority) fall back to the original Phase 1
+        assignment (shift = 0) so we never make things worse than the prior
+        unchecked shortcut behaviour."""
+        if not tmdb_eps or not any(e.overview for e in tmdb_eps):
+            return None  # synopsis data unavailable, can't check
+
+        shift_votes: Dict[int, int] = {}
+        null_count = 0
+        checked = 0
+
+        for entry in entries:
+            evidence_text = entry.get("evidence_text")
+            evidence_kind = entry.get("evidence_kind") or "evidence"
+            if not evidence_text:
+                continue
+            proposed = entry["proposed_ep"]
+            candidates: List[Tuple[int, str, str]] = []
+            for delta in (-2, -1, 0, 1, 2):
+                cand_ep = proposed + delta
+                if cand_ep < 1 or (max_canon and cand_ep > max_canon):
+                    continue
+                ep_obj = next((x for x in tmdb_eps if x.episode_number == cand_ep), None)
+                if ep_obj is None:
+                    continue
+                # Require some kind of synopsis for a non-trivial check.
+                # Allow the proposed ep through even without an overview so it
+                # remains a default option for the LLM to fall back to.
+                if not ep_obj.overview and delta != 0:
+                    continue
+                candidates.append((cand_ep, ep_obj.name, ep_obj.overview))
+            if len(candidates) < 2:
+                continue
+
+            try:
+                picked = call_llm_synopsis_pick(
+                    llm_client, args.model, evidence_text, evidence_kind, candidates
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"[SYNOPSIS] check failed for {entry['mkv'].name}: {e}")
+                continue
+
+            checked += 1
+            if picked is None:
+                null_count += 1
+                if verbose:
+                    print(f"[SYNOPSIS] {entry['mkv'].name}: no nearby episode matched")
+            else:
+                shift = picked - proposed
+                shift_votes[shift] = shift_votes.get(shift, 0) + 1
+                if verbose and shift != 0:
+                    print(f"[SYNOPSIS] {entry['mkv'].name}: Phase 1 said "
+                          f"E{proposed:02d}, synopsis best matches E{picked:02d} "
+                          f"(vote shift {shift:+d})")
+
+        if checked == 0:
+            return None
+        # Broad rejection: more than half the checked files said "no match."
+        # That means the contiguous shortcut isn't just shifted, it's wrong.
+        if null_count * 2 > checked:
+            return "refuse"
+        if not shift_votes:
+            return "refuse"
+
+        consensus_shift, votes = max(shift_votes.items(), key=lambda kv: kv[1])
+        total_voters = sum(shift_votes.values())
+        # Require a strict majority of voters to agree before we accept a
+        # non-zero shift. Otherwise default to Phase 1's original assignment.
+        if votes * 2 > total_voters:
+            return consensus_shift
+        return 0
 
     def _flush_folder(folder_key: str) -> None:
         """Reconcile Phase 1 proposals for a folder against contiguousness
@@ -1501,21 +1651,56 @@ def main():
         # Shortcut: if Phase 1's IDs (after outlier removal) form a contiguous
         # episode run when sorted, Phase 1 is internally self-consistent — the
         # LLM correctly identified the set of episodes, even if disc filename
-        # order doesn't match episode order. Trust Phase 1's per-file
-        # assignments directly without overriding via the file-order offset
-        # search. The offset-search override is reserved for the case where
-        # Phase 1 is scattered and file order is the only signal we have.
+        # order doesn't match episode order. But "internally consistent" is not
+        # the same as "correct" — the LLM can be systematically off by N across
+        # a whole disc, with every individual ID title-matching TMDB. The
+        # synopsis cross-check below catches that: each file votes for a shift
+        # by comparing its evidence against the plot synopses of nearby
+        # episodes. Consensus shift wins.
         if len(episode_entries) >= 2:
             sorted_proposed = sorted(e["proposed_ep"] for e in episode_entries)
             if sorted_proposed[-1] - sorted_proposed[0] == len(sorted_proposed) - 1 \
                     and all(e["confidence"] >= 0.85 for e in episode_entries):
-                print(f"[RECONCILE] folder {folder_key!r}: Phase 1 IDs form contiguous "
-                      f"run E{sorted_proposed[0]:02d}-E{sorted_proposed[-1]:02d} — "
-                      f"trusting per-file assignments without file-order override")
-                _apply_reconciled_renames(folder_key, show, season, episode_entries,
-                                          [e["proposed_ep"] for e in episode_entries],
-                                          tmdb_eps)
-                return
+                max_canon_for_shift = max((e.episode_number for e in tmdb_eps), default=0)
+                consensus_shift = _synopsis_consensus_shift(
+                    folder_key, episode_entries, tmdb_eps, max_canon_for_shift
+                )
+                # consensus_shift is None = couldn't run check; "refuse" = check
+                # said Phase 1 broadly wrong; int = apply this shift (may be 0).
+                if consensus_shift is None:
+                    print(f"[RECONCILE] folder {folder_key!r}: Phase 1 IDs form contiguous "
+                          f"run E{sorted_proposed[0]:02d}-E{sorted_proposed[-1]:02d} "
+                          f"(synopsis check unavailable) — trusting Phase 1 as-is")
+                    _apply_reconciled_renames(folder_key, show, season, episode_entries,
+                                              [e["proposed_ep"] for e in episode_entries],
+                                              tmdb_eps)
+                    return
+                if consensus_shift == "refuse":
+                    print(f"[SYNOPSIS] folder {folder_key!r}: synopsis check rejected the "
+                          f"contiguous run — falling through to file-order offset search")
+                    # do NOT return; fall through to the offset-search path below
+                else:
+                    shifted = [e["proposed_ep"] + consensus_shift for e in episode_entries]
+                    if any(a < 1 or a > max_canon_for_shift for a in shifted):
+                        print(f"[SYNOPSIS] folder {folder_key!r}: consensus shift "
+                              f"{consensus_shift:+d} would place episodes outside the "
+                              f"season — falling through to offset search")
+                    else:
+                        if consensus_shift == 0:
+                            print(f"[RECONCILE] folder {folder_key!r}: Phase 1 IDs form "
+                                  f"contiguous run E{sorted_proposed[0]:02d}-"
+                                  f"E{sorted_proposed[-1]:02d}, synopsis check confirms — "
+                                  f"trusting per-file assignments")
+                        else:
+                            new_lo = sorted_proposed[0] + consensus_shift
+                            new_hi = sorted_proposed[-1] + consensus_shift
+                            print(f"[RECONCILE] folder {folder_key!r}: Phase 1 said "
+                                  f"E{sorted_proposed[0]:02d}-E{sorted_proposed[-1]:02d}, "
+                                  f"synopsis consensus shifts run to E{new_lo:02d}-"
+                                  f"E{new_hi:02d} (shift {consensus_shift:+d})")
+                        _apply_reconciled_renames(folder_key, show, season, episode_entries,
+                                                  shifted, tmdb_eps)
+                        return
 
         proposed = [e["proposed_ep"] for e in episode_entries]
         n = len(episode_entries)
@@ -1995,7 +2180,8 @@ def main():
             # reconciler at the folder boundary may override final_ep_num /
             # final_title before the actual move.
             _queue_for_reconcile(folder, mkv, show, season, final_ep_num,
-                                  final_title, conf, dur_m, tmdb_confirmed_clean)
+                                  final_title, conf, dur_m, tmdb_confirmed_clean,
+                                  evidence_text=e_text, evidence_kind=e_kind)
             disc_context_list.append(f"S{season:02d}E{final_ep_num:02d} \"{final_title}\"")
             sk = (norm_title(show), season)
             show_season_last_ep[sk] = max(show_season_last_ep.get(sk, 0), final_ep_num)
@@ -2112,6 +2298,7 @@ def main():
 
                 _queue_for_reconcile(folder, mkv, final_show, final_season, final_ep_num,
                                       final_title, conf, dur_m, tmdb_confirmed_clean,
+                                      evidence_text=e_text, evidence_kind=e_kind,
                                       is_blind=True)
                 disc_context_list.append(f"{final_show} S{final_season:02d}E{final_ep_num:02d} \"{final_title}\"")
                 sk = (norm_title(final_show), final_season)
