@@ -408,6 +408,110 @@ def extract_subtitle_excerpt(
         return excerpt if excerpt else None
 
 
+def extract_subtitle_windows(
+    mkv_path: Path,
+    max_lines: int = 80,
+    max_chars_per_window: int = 2000,
+    skip_head_seconds: float = 300.0,
+) -> Optional[List[Tuple[str, str]]]:
+    """Same EARLY/MID/LATE sampling as extract_subtitle_excerpt but returns the
+    three windows as separate (label, text) tuples instead of concatenating.
+
+    Used for multi-window Phase 1 voting (bug 152): each window goes to its
+    own LLM call so a confidently-wrong identification only gets one vote
+    out of N. The single-excerpt path concatenates first and asks the LLM
+    to commit once, which lets one strong content cue dominate.
+
+    Returns None if subtitles unavailable / bitmap-only. Returns fewer than
+    three windows when the post-intro span doesn't yield enough cues for
+    every section — callers should fall back to the single-excerpt path
+    in that case.
+    """
+    streams = ffprobe_subtitle_streams(mkv_path)
+    if streams and subtitles_are_bitmap_only(streams):
+        return None
+
+    sub_stream_index = pick_best_subtitle_stream(streams)
+    if sub_stream_index is None:
+        return None
+
+    with tempfile.TemporaryDirectory() as td:
+        srt_path = Path(td) / "subs.srt"
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(mkv_path),
+            "-map", f"0:{sub_stream_index}",
+            str(srt_path)
+        ]
+        rc, _, _ = run_cmd(cmd)
+        if rc != 0 or not srt_path.exists():
+            return None
+
+        try:
+            txt = srt_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            txt = srt_path.read_text(encoding="latin-1", errors="ignore")
+
+        cues: List[Tuple[float, str]] = []
+        current_start: Optional[float] = None
+        current_buf: List[str] = []
+
+        def _flush():
+            if current_start is not None and current_buf:
+                text = " ".join(current_buf).strip()
+                if text:
+                    cues.append((current_start, text))
+
+        for raw_line in txt.splitlines():
+            line = raw_line.strip()
+            if not line:
+                _flush()
+                current_start = None
+                current_buf = []
+                continue
+            if re.fullmatch(r"\d+", line):
+                continue
+            ts = _SRT_TS_RE.match(line)
+            if ts:
+                _flush()
+                current_start = _srt_ts_to_seconds(ts.group(1), ts.group(2), ts.group(3), ts.group(4))
+                current_buf = []
+                continue
+            line = re.sub(r"</?i>", "", line)
+            line = re.sub(r"</?b>", "", line)
+            line = re.sub(r"</?u>", "", line)
+            line = re.sub(r"{\\.*?}", "", line)
+            line = re.sub(r"^\[.*?\]\s*", "", line)
+            line = re.sub(r"^\(.*?\)\s*", "", line)
+            if line:
+                current_buf.append(line)
+        _flush()
+
+        if not cues:
+            return None
+
+        filtered = [(t, dlg) for (t, dlg) in cues if t >= skip_head_seconds]
+        if not filtered:
+            filtered = cues
+
+        end_time = filtered[-1][0] if filtered else 0.0
+        start_time = filtered[0][0] if filtered else 0.0
+        span = max(1.0, end_time - start_time)
+
+        per_section = max(1, max_lines // 3)
+        windows: List[Tuple[str, str]] = []
+        for label, frac in [("EARLY", 0.0), ("MID", 0.34), ("LATE", 0.67)]:
+            target_t = start_time + frac * span
+            idx = next((i for i, (t, _) in enumerate(filtered) if t >= target_t), 0)
+            chunk = [dlg for _, dlg in filtered[idx : idx + per_section]]
+            if chunk:
+                text = "\n".join(chunk)[:max_chars_per_window].strip()
+                if text:
+                    windows.append((label, text))
+
+        return windows if windows else None
+
+
 # ----------------------------
 # Audio extraction + transcription
 # ----------------------------
@@ -2043,9 +2147,13 @@ def main():
 
         evidence_text = None
         evidence_kind = None
+        subtitle_windows: Optional[List[Tuple[str, str]]] = None
 
         if not (streams and subtitles_are_bitmap_only(streams)):
+            # Extract both the concatenated excerpt (single-call fallback path)
+            # and the separate windows (multi-window voting path, bug 152).
             subtitle_excerpt = extract_subtitle_excerpt(mkv, max_lines=args.max_sub_lines)
+            subtitle_windows = extract_subtitle_windows(mkv, max_lines=args.max_sub_lines)
             if subtitle_excerpt:
                 evidence_text = subtitle_excerpt
                 evidence_kind = "subtitle excerpt"
@@ -2166,7 +2274,12 @@ def main():
         _show_season_key = (norm_title(show) if show else "", season or 0)
         _cross_disc_last = show_season_last_ep.get(_show_season_key) if (show and season and not disc_context_list) else None
 
-        def attempt_llm_with_evidence(stage: str, e_text: str, e_kind: str) -> Tuple[bool, Optional[dict], str]:
+        def _phase1_run_call_only(stage: str, e_text: str, e_kind: str) -> Tuple[Optional[dict], str]:
+            """Single Phase 1 LLM call + log + cheap pre-TMDB filtering. Returns
+            (result, fail_code) where fail_code is "ok" if the result is a real
+            episode with sufficient confidence and the required fields. Shared
+            between the single-call path and the multi-window vote path so
+            voting can tally results without re-running TMDB verify per window."""
             nonlocal errors
             try:
                 result = call_llm_identify(
@@ -2181,13 +2294,13 @@ def main():
             except Exception as e:
                 errors += 1
                 print(f"[ERR  ] LLM call failed ({stage}): {e}")
-                return False, None, "llm_error"
+                return None, "llm_error"
 
-            compact, passes = format_llm_compact(result, season, args.min_confidence)
+            compact, _passes = format_llm_compact(result, season, args.min_confidence)
             if verbose:
                 print(f"[LLM  ] {stage} -> {compact}")
                 notes = one_line(result.get("notes", ""), 140)
-                if notes and not passes:
+                if notes and not _passes:
                     print(f"       reason: {notes}")
 
             is_episode = bool(result.get("is_episode"))
@@ -2199,14 +2312,25 @@ def main():
             # even if it flagged is_episode=false (standalone specials are not "episodes"
             # in the traditional sense, but we still want to name them).
             if not is_episode and not hints_skip_tmdb:
-                return False, result, "non_episode"
+                return result, "non_episode"
             if not is_episode and hints_skip_tmdb and (not ep_title or conf < args.min_confidence):
-                # Truly unidentifiable even in collection mode
-                return False, result, "non_episode"
+                return result, "non_episode"
             if conf < args.min_confidence:
-                return False, result, "low_conf"
+                return result, "low_conf"
             if not isinstance(ep_num, int) or not ep_title:
-                return False, result, "missing_fields"
+                return result, "missing_fields"
+            return result, "ok"
+
+        def _phase1_finalize(stage: str, result: dict, e_text: str, e_kind: str
+                             ) -> Tuple[bool, Optional[dict], str]:
+            """TMDB verify + conflict check + queue-for-reconcile. Pure function
+            of (result, evidence, e_kind) given the surrounding closure. Called
+            after either a single Phase 1 LLM call or a successful multi-window
+            vote has picked a winner."""
+            nonlocal errors
+            ep_num = result["episode_number"]
+            ep_title = result["episode_title"]
+            conf = float(result.get("confidence", 0.0))
 
             final_ep_num = ep_num
             final_title = ep_title
@@ -2268,6 +2392,72 @@ def main():
             _maybe_write_folder_hints(folder, mkv.parent, show, season, mkv.name,
                                       tmdb_confirmed_clean, conf)
             return True, result, "queued"
+
+        def attempt_llm_with_evidence(stage: str, e_text: str, e_kind: str) -> Tuple[bool, Optional[dict], str]:
+            result, fail_code = _phase1_run_call_only(stage, e_text, e_kind)
+            if fail_code != "ok":
+                return False, result, fail_code
+            return _phase1_finalize(stage, result, e_text, e_kind)
+
+        def attempt_llm_subtitle_vote(windows: List[Tuple[str, str]]
+                                       ) -> Tuple[bool, Optional[dict], str]:
+            """3b: Phase 1 LLM votes across independent subtitle windows.
+
+            Runs one LLM call per window. Tallies episode_number among results
+            that pass the cheap pre-TMDB filter. Requires a strict majority of
+            ALL windows to commit (>n/2 votes for one episode) — not just a
+            plurality among passing windows. If no majority emerges, returns
+            "vote_ambiguous" without renaming so the file lands in Extras for
+            review rather than getting a confidently-wrong rename.
+
+            On majority: picks the highest-confidence representative of the
+            winning episode, runs TMDB verify + queue once with that result.
+            Combined window text is stored as evidence_text so the later
+            synopsis cross-check still has the full per-window context."""
+            nonlocal errors
+            n = len(windows)
+            if n < 2:
+                return False, None, "vote_too_few_windows"
+
+            window_results: List[Tuple[str, str, Optional[dict], str]] = []
+            for i, (label, text) in enumerate(windows, 1):
+                stage = f"WINDOW {i}/{n} ({label})"
+                result, fail_code = _phase1_run_call_only(stage, text, f"subtitle window {i}/{n}")
+                window_results.append((label, text, result, fail_code))
+
+            ep_votes: Dict[int, List[Tuple[str, str, dict]]] = {}
+            for label, text, result, fail_code in window_results:
+                if fail_code != "ok" or result is None:
+                    continue
+                ep = result["episode_number"]
+                ep_votes.setdefault(ep, []).append((label, text, result))
+
+            if not ep_votes:
+                print(f"[VOTE ] no window produced a passing identification")
+                # Return the first non-ok fail code so the caller can route
+                # the file appropriately (audio retry, non-episode, etc.)
+                first_fail = next((fc for _, _, _, fc in window_results if fc != "ok"),
+                                  "vote_no_pass")
+                first_result = next((r for _, _, r, fc in window_results if fc == first_fail), None)
+                return False, first_result, first_fail
+
+            winner_ep, winner_results = max(ep_votes.items(), key=lambda kv: len(kv[1]))
+
+            if len(winner_results) * 2 <= n:
+                picks = ", ".join(f"E{ep:02d}×{len(v)}" for ep, v in sorted(ep_votes.items()))
+                print(f"[VOTE ] ambiguous — windows split: {picks} (no majority of {n})")
+                return False, None, "vote_ambiguous"
+
+            best = max(winner_results, key=lambda lv: float(lv[2].get("confidence", 0.0)))
+            _winning_label, _winning_text, winning_result = best
+            title = winning_result.get("episode_title", "?")
+            conf = float(winning_result.get("confidence", 0.0))
+            print(f"[VOTE ] majority -> S{season:02d}E{winner_ep:02d} \"{title}\" "
+                  f"({len(winner_results)}/{n} votes, conf={conf:.2f})")
+
+            combined_text = "\n\n".join(f"[{lab}]\n{txt}" for lab, txt, _, _ in window_results)
+            combined_kind = f"subtitle multi-window vote ({len(winner_results)}/{n})"
+            return _phase1_finalize("VOTE", winning_result, combined_text, combined_kind)
 
         if folder_parse_failed:
             # Blind mode: redefine attempt_llm_with_evidence to identify show+season+episode
@@ -2387,10 +2577,37 @@ def main():
                                           mkv.name, tmdb_confirmed_clean, conf)
                 return True, result, "queued"
 
-        renamed_ok, first_result, fail_code = attempt_llm_with_evidence("PRIMARY", evidence_text, evidence_kind)
+        # Multi-window voting (bug 152): when we have 3+ independent subtitle
+        # windows and we're NOT in blind mode (voting helpers are defined only
+        # for the hinted path), commit only on majority agreement across
+        # windows. A confidently-wrong identification on one window is one
+        # vote of three. Falls back to the single-call path when too few
+        # windows are available or evidence is audio-based.
+        used_vote = False
+        if subtitle_windows and len(subtitle_windows) >= 3 and not folder_parse_failed:
+            used_vote = True
+            renamed_ok, first_result, fail_code = attempt_llm_subtitle_vote(subtitle_windows)
+        else:
+            renamed_ok, first_result, fail_code = attempt_llm_with_evidence(
+                "PRIMARY", evidence_text, evidence_kind
+            )
 
         if renamed_ok:
-            print("[QUEUE] held for folder reconciliation" + (" (blind)" if folder_parse_failed else ""))
+            print("[QUEUE] held for folder reconciliation"
+                  + (" (vote)" if used_vote else "")
+                  + (" (blind)" if folder_parse_failed else ""))
+            continue
+
+        # A no-majority vote should not fall through to other identification
+        # paths — silence is the right outcome until a human reviews the file.
+        if used_vote and fail_code == "vote_ambiguous":
+            skipped_low_conf += 1
+            print("[SKIP ] subtitle windows disagree — no majority, refusing to rename")
+            if dest_root and show and season:
+                extras_queue.append((mkv, show, season))
+            else:
+                skipped_files.append({"file": mkv.name,
+                                      "reason": "subtitle windows disagreed (vote ambiguous)"})
             continue
 
         # Conflict: subtitle identified an already-claimed episode — retry with audio
