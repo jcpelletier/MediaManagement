@@ -1663,23 +1663,20 @@ def main():
         if not shift_votes:
             return "refuse"
 
-        # Pick the leading non-zero shift and accept it only when it
-        # outvotes BOTH the zero-shift confirmations AND the combined
-        # other non-zero shifts. Treating zero votes the same as non-zero
-        # votes in a simple strict-majority test was hiding correct shifts
-        # behind a handful of "this file is fine as-is" confirmations
-        # (bug 152, D2 of build #64: 4 of 9 files voted shift -1 but two
-        # silent zero votes pushed the count below 50% and the wrong run
-        # was kept). The zero-bucket comparison is the safety rail: if as
-        # many files say "no shift needed" as say "shift by N", we still
-        # default to Phase 1.
-        nonzero_shifts = {k: v for k, v in shift_votes.items() if k != 0}
-        if not nonzero_shifts:
-            return 0
-        consensus_shift, votes = max(nonzero_shifts.items(), key=lambda kv: kv[1])
-        zero_votes = shift_votes.get(0, 0)
-        other_nonzero = sum(v for k, v in nonzero_shifts.items() if k != consensus_shift)
-        if votes > zero_votes and votes > other_nonzero:
+        # Strict majority of total voters: more than half of all files that
+        # produced a synopsis pick must agree on the same shift before we
+        # override Phase 1's per-file assignments. This was relaxed in the
+        # build #65 fix to "non-zero leader outvotes zeros and other non-zero
+        # shifts" because pre-voting Phase 1 was unreliable and we needed the
+        # synopsis check to do more work. With multi-window Phase 1 voting
+        # now in place (bug 152, build #66+), Phase 1 is the reliable signal
+        # and the synopsis check is the noisier one — applying its shift on a
+        # narrow plurality overrides vote-verified runs and re-introduces the
+        # exact wrong-slot renames it was meant to catch. Strict majority is
+        # the correct bar in the post-voting regime.
+        consensus_shift, votes = max(shift_votes.items(), key=lambda kv: kv[1])
+        total_voters = sum(shift_votes.values())
+        if votes * 2 > total_voters:
             return consensus_shift
         return 0
 
