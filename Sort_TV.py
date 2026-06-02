@@ -1593,12 +1593,8 @@ def main():
 
         runtimes = [e.runtime for e in tmdb_eps if e.runtime]
         if runtimes:
-            # Wider on the high side than the low side because Pilots and
-            # season finales legitimately run long on DVD (e.g. AD S01E01
-            # is ~28.6 min while TMDB reports 22 min average) — bug 152.
-            # The low side still filters out menu loops and short clips.
-            r_min = min(runtimes) * 0.7
-            r_max = max(runtimes) * 1.4
+            r_min = min(runtimes) * 0.8
+            r_max = max(runtimes) * 1.2
         else:
             r_min = r_max = None
 
