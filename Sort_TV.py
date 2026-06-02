@@ -1739,11 +1739,18 @@ def main():
 
         best_start = None
         best_score = (-1, -1.0)
+        second_start = None
+        second_score = (-1, -1.0)
         for start in range(search_lo, search_hi + 1):
             s = _score(start)
             if s > best_score:
+                second_score = best_score
+                second_start = best_start
                 best_score = s
                 best_start = start
+            elif s > second_score:
+                second_score = s
+                second_start = start
 
         if best_start is None:
             print(f"[RECONCILE] folder {folder_key!r}: no plausible offset, files left in place")
@@ -1753,8 +1760,68 @@ def main():
         print(f"[RECONCILE] folder {folder_key!r}: best offset E{best_start:02d} "
               f"(anchor_score={anchor_pts} runtime_bonus={runtime_pts:.0f}, {n} file(s))")
 
+        # Synopsis validation: run the same cross-check used on the shortcut
+        # path, but centred on the offset-search winner rather than Phase 1's
+        # proposed episodes. Catches the case where N clustered-but-wrong Phase
+        # 1 anchors outscore a single correct anchor (e.g. E10-E13 beats E01).
+        validated_start = best_start
+        if tmdb_eps and any(e.get("evidence_text") for e in episode_entries):
+            max_canon_os = max((e.episode_number for e in tmdb_eps), default=0)
+            search_ceil = max(1, max_canon_os - n + 1)
+
+            def _synopsis_validate(candidate_start: int) -> Any:
+                """Return _synopsis_consensus_shift result for a given offset."""
+                tmp_entries = [
+                    dict(e, proposed_ep=candidate_start + idx)
+                    for idx, e in enumerate(episode_entries)
+                ]
+                return _synopsis_consensus_shift(
+                    folder_key, tmp_entries, tmdb_eps, max_canon_os
+                )
+
+            result = _synopsis_validate(best_start)
+            if result is None:
+                pass  # no synopses or no evidence — can't check, keep best_start
+            elif result == "refuse":
+                if second_start is not None:
+                    print(f"[SYNOPSIS] folder {folder_key!r}: synopsis rejects anchor-score "
+                          f"winner E{best_start:02d} — trying runner-up E{second_start:02d}")
+                    result2 = _synopsis_validate(second_start)
+                    if result2 is None or result2 == "refuse":
+                        print(f"[SYNOPSIS] folder {folder_key!r}: runner-up E{second_start:02d} "
+                              f"also rejected — refusing to rename folder")
+                        return
+                    shift2 = result2 if isinstance(result2, int) else 0
+                    new_s = second_start + shift2
+                    if 1 <= new_s <= search_ceil:
+                        print(f"[SYNOPSIS] folder {folder_key!r}: runner-up E{second_start:02d} "
+                              f"confirmed (shift {shift2:+d}) — using E{new_s:02d}")
+                        validated_start = new_s
+                    else:
+                        print(f"[SYNOPSIS] folder {folder_key!r}: runner-up shift out of range "
+                              f"— refusing to rename folder")
+                        return
+                else:
+                    print(f"[SYNOPSIS] folder {folder_key!r}: synopsis rejects "
+                          f"E{best_start:02d} and no runner-up available — refusing to rename")
+                    return
+            else:
+                shift = result
+                new_s = best_start + shift
+                if 1 <= new_s <= search_ceil:
+                    if shift != 0:
+                        print(f"[SYNOPSIS] folder {folder_key!r}: synopsis shifts offset "
+                              f"from E{best_start:02d} to E{new_s:02d} (shift {shift:+d})")
+                    else:
+                        print(f"[SYNOPSIS] folder {folder_key!r}: synopsis confirms "
+                              f"offset E{best_start:02d}")
+                    validated_start = new_s
+                else:
+                    print(f"[SYNOPSIS] folder {folder_key!r}: synopsis shift out of range "
+                          f"— keeping anchor-score offset E{best_start:02d}")
+
         _apply_reconciled_renames(folder_key, show, season, episode_entries,
-                                  [best_start + i for i in range(n)], tmdb_eps)
+                                  [validated_start + i for i in range(n)], tmdb_eps)
 
     def _apply_reconciled_renames(folder_key: str, show: str, season: int,
                                    entries: List[Dict[str, Any]],
