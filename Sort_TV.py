@@ -1559,11 +1559,23 @@ def main():
         if not shift_votes:
             return "refuse"
 
-        consensus_shift, votes = max(shift_votes.items(), key=lambda kv: kv[1])
-        total_voters = sum(shift_votes.values())
-        # Require a strict majority of voters to agree before we accept a
-        # non-zero shift. Otherwise default to Phase 1's original assignment.
-        if votes * 2 > total_voters:
+        # Pick the leading non-zero shift and accept it only when it
+        # outvotes BOTH the zero-shift confirmations AND the combined
+        # other non-zero shifts. Treating zero votes the same as non-zero
+        # votes in a simple strict-majority test was hiding correct shifts
+        # behind a handful of "this file is fine as-is" confirmations
+        # (bug 152, D2 of build #64: 4 of 9 files voted shift -1 but two
+        # silent zero votes pushed the count below 50% and the wrong run
+        # was kept). The zero-bucket comparison is the safety rail: if as
+        # many files say "no shift needed" as say "shift by N", we still
+        # default to Phase 1.
+        nonzero_shifts = {k: v for k, v in shift_votes.items() if k != 0}
+        if not nonzero_shifts:
+            return 0
+        consensus_shift, votes = max(nonzero_shifts.items(), key=lambda kv: kv[1])
+        zero_votes = shift_votes.get(0, 0)
+        other_nonzero = sum(v for k, v in nonzero_shifts.items() if k != consensus_shift)
+        if votes > zero_votes and votes > other_nonzero:
             return consensus_shift
         return 0
 
