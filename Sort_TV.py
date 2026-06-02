@@ -1486,12 +1486,16 @@ def main():
         max_canon: int,
     ) -> Any:
         """For each file in a contiguous-run shortcut candidate, ask the LLM
-        which of the nearby episodes (proposed ± 2) best matches the file's
-        evidence based on plot synopses. Each file's pick votes for a shift
-        relative to its Phase 1 proposed episode. Returns:
+        which canonical season episode best matches the file's evidence based
+        on plot synopses. The candidate set is the full season (not a narrow
+        window around the Phase 1 proposal) so a systematically off-by-N
+        proposal can still be rescued — bug 152 turned up cases where the
+        LLM hallucinated a confident contiguous run eight episodes off
+        truth, well outside any small window. Each file's pick votes for a
+        shift relative to its Phase 1 proposed episode. Returns:
           - None if the check cannot run (no synopses, no evidence retained)
-          - "refuse" if the LLM broadly rejects nearby candidates (Phase 1 is
-            wrong in a way a simple shift can't fix)
+          - "refuse" if the LLM broadly rejects every candidate (Phase 1 is
+            wrong in a way no shift can fix)
           - int (negative, zero, positive) shift to apply when a majority of
             files agree on a single shift
         Ambiguous votes (no majority) fall back to the original Phase 1
@@ -1511,17 +1515,14 @@ def main():
                 continue
             proposed = entry["proposed_ep"]
             candidates: List[Tuple[int, str, str]] = []
-            for delta in (-2, -1, 0, 1, 2):
-                cand_ep = proposed + delta
+            for ep_obj in tmdb_eps:
+                cand_ep = ep_obj.episode_number
                 if cand_ep < 1 or (max_canon and cand_ep > max_canon):
                     continue
-                ep_obj = next((x for x in tmdb_eps if x.episode_number == cand_ep), None)
-                if ep_obj is None:
-                    continue
-                # Require some kind of synopsis for a non-trivial check.
-                # Allow the proposed ep through even without an overview so it
-                # remains a default option for the LLM to fall back to.
-                if not ep_obj.overview and delta != 0:
+                # Require a synopsis. Always include the proposed ep so it
+                # remains an option for the LLM to fall back to even when
+                # TMDB has no overview text for it.
+                if not ep_obj.overview and cand_ep != proposed:
                     continue
                 candidates.append((cand_ep, ep_obj.name, ep_obj.overview))
             if len(candidates) < 2:
@@ -1592,8 +1593,12 @@ def main():
 
         runtimes = [e.runtime for e in tmdb_eps if e.runtime]
         if runtimes:
-            r_min = min(runtimes) * 0.8
-            r_max = max(runtimes) * 1.2
+            # Wider on the high side than the low side because Pilots and
+            # season finales legitimately run long on DVD (e.g. AD S01E01
+            # is ~28.6 min while TMDB reports 22 min average) — bug 152.
+            # The low side still filters out menu loops and short clips.
+            r_min = min(runtimes) * 0.7
+            r_max = max(runtimes) * 1.4
         else:
             r_min = r_max = None
 
