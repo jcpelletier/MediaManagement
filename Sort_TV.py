@@ -512,6 +512,108 @@ def extract_subtitle_windows(
         return windows if windows else None
 
 
+def extract_subtitle_full(
+    mkv_path: Path,
+    max_chars: int = 60000,
+    skip_head_seconds: float = 300.0,
+) -> Optional[str]:
+    """Pull the full post-intro subtitle dialogue as a single block of text.
+
+    Used by the season-match identifier (bug 152 rewrite): instead of three
+    short windows + concat + 4K-char cap, the LLM sees enough plot beats from
+    the whole episode to disambiguate against the full TMDB synopsis list
+    in a single constrained-choice call. A 22-minute AD episode produces
+    ~10-15K chars of post-intro dialogue, well inside the 60K safety cap
+    and well inside DeepSeek-V3's context window.
+
+    Returns None when subtitles are unavailable / bitmap-only / parse-fails.
+    Returns the dialogue text on success; falls back to all cues when the
+    whole file fits inside the intro-skip window."""
+    streams = ffprobe_subtitle_streams(mkv_path)
+    if streams and subtitles_are_bitmap_only(streams):
+        return None
+
+    sub_stream_index = pick_best_subtitle_stream(streams)
+    if sub_stream_index is None:
+        return None
+
+    with tempfile.TemporaryDirectory() as td:
+        srt_path = Path(td) / "subs.srt"
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(mkv_path),
+            "-map", f"0:{sub_stream_index}",
+            str(srt_path)
+        ]
+        rc, _, _ = run_cmd(cmd)
+        if rc != 0 or not srt_path.exists():
+            return None
+
+        try:
+            txt = srt_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            txt = srt_path.read_text(encoding="latin-1", errors="ignore")
+
+        cues: List[Tuple[float, str]] = []
+        current_start: Optional[float] = None
+        current_buf: List[str] = []
+
+        def _flush():
+            if current_start is not None and current_buf:
+                text = " ".join(current_buf).strip()
+                if text:
+                    cues.append((current_start, text))
+
+        for raw_line in txt.splitlines():
+            line = raw_line.strip()
+            if not line:
+                _flush()
+                current_start = None
+                current_buf = []
+                continue
+            if re.fullmatch(r"\d+", line):
+                continue
+            ts = _SRT_TS_RE.match(line)
+            if ts:
+                _flush()
+                current_start = _srt_ts_to_seconds(ts.group(1), ts.group(2), ts.group(3), ts.group(4))
+                current_buf = []
+                continue
+            line = re.sub(r"</?i>", "", line)
+            line = re.sub(r"</?b>", "", line)
+            line = re.sub(r"</?u>", "", line)
+            line = re.sub(r"{\\.*?}", "", line)
+            line = re.sub(r"^\[.*?\]\s*", "", line)
+            line = re.sub(r"^\(.*?\)\s*", "", line)
+            if line:
+                current_buf.append(line)
+        _flush()
+
+        if not cues:
+            return None
+
+        filtered = [(t, dlg) for (t, dlg) in cues if t >= skip_head_seconds]
+        if not filtered:
+            filtered = cues
+
+        # Emit "[time]" markers every 60 seconds of timeline so the LLM can
+        # reason about plot ordering ("the meet happens early, the reveal is
+        # near the end"). Markers are small but help long-context reasoning.
+        out: List[str] = []
+        last_minute = -1
+        for t, dlg in filtered:
+            minute = int(t // 60)
+            if minute != last_minute:
+                out.append(f"\n[{minute}m]")
+                last_minute = minute
+            out.append(dlg)
+
+        joined = " ".join(out).strip()
+        if len(joined) > max_chars:
+            joined = joined[:max_chars]
+        return joined if joined else None
+
+
 # ----------------------------
 # Audio extraction + transcription
 # ----------------------------
@@ -999,6 +1101,128 @@ def call_llm_synopsis_pick(
     if picked not in valid_eps:
         return None
     return picked
+
+
+def call_llm_match_against_season(
+    client: DeepSeekClient,
+    model: str,
+    show: str,
+    season: int,
+    evidence_text: str,
+    duration_minutes: float,
+    evidence_kind: str,
+    tmdb_episodes: List["TmdbEpisode"],
+    file_basename: str = "",
+) -> dict:
+    """Given full post-intro dialogue and every episode's TMDB synopsis for
+    the season, ask the LLM which episode this file contains, plus a short
+    summary explaining the match. Replaces the previous Phase 1 + voting +
+    synopsis-shift stack with one constrained-choice call per file.
+
+    Why this works better than the prior 4K-char excerpt approach: the LLM
+    sees ~10-15K chars of specific plot beats (more than enough to
+    disambiguate similar episodes in a season) and is forced to pick from
+    the actual season's episodes rather than freely invent a title. The
+    summary it returns is a stable, human-readable fingerprint of the
+    file's content that we cache in sort_hints.json — future runs that
+    encounter the same file by size+mtime skip the LLM call entirely.
+
+    Returns a dict with the same shape as call_llm_identify (is_episode,
+    show, season, episode_number, episode_title, confidence, notes) plus a
+    'summary' field. Confidence is the LLM's reported confidence in its
+    pick. If is_episode=false, the file is identified as a non-episode
+    extra/featurette and should be routed to Extras."""
+    class _SeasonMatch(BaseModel):
+        is_episode: bool
+        episode_number: Optional[int] = None
+        episode_title: Optional[str] = None
+        summary: str = ""
+        confidence: float
+        notes: str = ""
+
+    if not tmdb_episodes:
+        # No synopses to match against — caller should fall back to the
+        # generic identifier. Return is_episode=false to signal that.
+        return {
+            "is_episode": False,
+            "show": show,
+            "season": season,
+            "episode_number": None,
+            "episode_title": None,
+            "summary": "",
+            "confidence": 0.0,
+            "notes": "no TMDB episode list available",
+        }
+
+    candidate_block = "\n\n".join(
+        f"E{ep.episode_number:02d} \"{ep.name}\""
+        + (f" ({ep.runtime} min)" if ep.runtime else "")
+        + f"\n  Synopsis: {ep.overview or '(no synopsis available)'}"
+        for ep in tmdb_episodes
+    )
+
+    prompt = (
+        f"You are identifying which episode of {show} Season {season} the "
+        f"following dialogue is from. The dialogue is the full post-intro "
+        f"transcript of one episode (with [Nm] markers showing minutes into "
+        f"the episode). Pick the single episode whose plot synopsis best "
+        f"matches the specific plot beats, named characters, settings, and "
+        f"events in the dialogue — not the show's recurring style or general "
+        f"tone.\n\n"
+        f"Also produce a 2-3 sentence factual summary of what happens in this "
+        f"file based on the dialogue. The summary should describe the actual "
+        f"plot beats observed, not just restate the synopsis you matched to.\n\n"
+        f"If the dialogue is clearly not a numbered episode of {show} S{season} "
+        f"(behind-the-scenes featurette, deleted-scenes reel, audio commentary, "
+        f"production interviews) set is_episode=false and explain in notes.\n\n"
+        f"FILE: {file_basename}\n"
+        f"FILE DURATION: {duration_minutes:.1f} minutes\n"
+        f"EVIDENCE TYPE: {evidence_kind}\n\n"
+        f"DIALOGUE:\n\"\"\"\n{evidence_text}\n\"\"\"\n\n"
+        f"CANDIDATE EPISODES (Season {season} of {show}):\n{candidate_block}\n\n"
+        f"Return only the JSON object."
+    )
+
+    try:
+        result = client.parse(
+            system="Return only the structured JSON result matching the schema.",
+            user=prompt,
+            schema=_SeasonMatch,
+            model=model,
+            max_tokens=1024,
+        )
+    except Exception as e:
+        return {
+            "is_episode": False,
+            "show": show,
+            "season": season,
+            "episode_number": None,
+            "episode_title": None,
+            "summary": "",
+            "confidence": 0.0,
+            "notes": f"LLM call failed: {e}",
+        }
+
+    # Snap the title to the canonical TMDB title for the picked episode so
+    # the rename uses the source-of-truth string regardless of how the LLM
+    # phrases it.
+    canonical_title = None
+    if isinstance(result.episode_number, int):
+        for ep in tmdb_episodes:
+            if ep.episode_number == result.episode_number:
+                canonical_title = ep.name
+                break
+
+    return {
+        "is_episode": result.is_episode,
+        "show": show,
+        "season": season,
+        "episode_number": result.episode_number,
+        "episode_title": canonical_title or result.episode_title,
+        "summary": result.summary,
+        "confidence": result.confidence,
+        "notes": result.notes,
+    }
 
 
 def format_llm_compact(result: dict, season: int, min_conf: float) -> Tuple[str, bool]:
@@ -1499,8 +1723,74 @@ def main():
     # Per-folder episode guide (fetched once from TMDB, keyed by (show, season)).
     episode_guide_cache: Dict[Tuple, Optional[str]] = {}
 
+    # Raw TMDB episode list cache, keyed by (show_lower, season). Used by the
+    # season-match identifier (bug 152 rewrite) which needs the full episode
+    # set including synopses, not the formatted episode_guide string.
+    tmdb_eps_cache: Dict[Tuple, Optional[List[TmdbEpisode]]] = {}
+
+    def _get_tmdb_eps(show_name: str, season_num: int) -> Optional[List[TmdbEpisode]]:
+        """Return the cached TMDB episode list for (show, season), fetching
+        if not yet cached. Returns None on any failure."""
+        if not show_name or not isinstance(season_num, int) or season_num < 1:
+            return None
+        key = (show_name.lower(), season_num)
+        if key not in tmdb_eps_cache:
+            if tmdb_client is None:
+                tmdb_eps_cache[key] = None
+            else:
+                try:
+                    tv_id = tmdb_client.find_tv_id(show_name)
+                    if tv_id:
+                        eps = tmdb_client.get_season_episodes(tv_id, season_num)
+                        tmdb_eps_cache[key] = eps if eps else None
+                    else:
+                        tmdb_eps_cache[key] = None
+                except Exception:
+                    tmdb_eps_cache[key] = None
+        return tmdb_eps_cache.get(key)
+
     # Per-folder sort_hints.json overrides (keyed by folder name).
     folder_hints_cache: Dict[str, dict] = {}
+
+    # Bug 152 rewrite: cache the LLM's per-file episode summary in
+    # sort_hints.json under a "file_summaries" block so a subsequent run on
+    # the same file (matched by size + mtime) skips the LLM call entirely.
+    # The summary is also human-readable in the JSON, which gives reviewers
+    # a clear record of "what the script thought this file is about".
+    def _load_cached_file_summary(folder_key: str, filename: str,
+                                   size: int, mtime: float) -> Optional[dict]:
+        """Look up a cached identification for this file. Returns the cached
+        result only when the on-disk size + mtime match what was recorded —
+        any drift invalidates the entry."""
+        hints = folder_hints_cache.get(folder_key) or {}
+        summaries = hints.get("file_summaries") or {}
+        entry = summaries.get(filename)
+        if not entry:
+            return None
+        cached_size = entry.get("size")
+        cached_mtime = entry.get("mtime")
+        if cached_size != size:
+            return None
+        if cached_mtime is None or abs(float(cached_mtime) - mtime) > 1.0:
+            return None
+        return entry
+
+    def _save_file_summary(folder_key: str, folder_path: Path, filename: str,
+                            summary_dict: dict) -> None:
+        """Write the file's identification + summary into sort_hints.json's
+        file_summaries block. Creates the hints file if missing. Idempotent
+        per (folder, filename)."""
+        if args.dry_run:
+            return
+        hints = folder_hints_cache.setdefault(folder_key, {})
+        summaries = hints.setdefault("file_summaries", {})
+        summaries[filename] = summary_dict
+        hints_path = folder_path / "sort_hints.json"
+        try:
+            hints_path.write_text(json.dumps(hints, indent=2))
+        except Exception as e:
+            if verbose:
+                print(f"[WARN ] could not persist file summary to {hints_path}: {e}")
 
     # Per-folder count of TMDB-clean identifications keyed by (folder, show, season).
     # When any (show, season) reaches 2 confirmations in a folder, write
@@ -1681,28 +1971,29 @@ def main():
         return 0
 
     def _flush_folder(folder_key: str) -> None:
-        """Reconcile Phase 1 proposals for a folder against contiguousness
-        and TMDB runtime range, then actually rename. Per the design:
-        - runtime outliers move to Extras (TMDB season [min, max] ± 20%)
-        - the remaining files in disc filename order are assumed contiguous
-          in episode number; the starting offset is found by anchor agreement
-        - contiguousness beats individual high-confidence Phase 1 answers"""
+        """Bug 152 rewrite: the reconciler used to impose a contiguous-run
+        + offset-search + synopsis-shift model on the folder's Phase 1
+        proposals — that model assumed filename order equals episode order
+        on disc, which is just not true for box-set DVDs (AD S1 has at
+        least one cross-file swap and multiple duplicate playlists). With
+        the new season-match identifier giving us reliable per-file
+        episode IDs, the reconciler shrinks to two safety nets:
+          1. Runtime-outlier filter: files whose runtime is far outside the
+             season's TMDB-reported range go to Extras (catches menu loops,
+             featurettes that survived the LLM's non-episode check, and
+             extended-cut duplicates).
+          2. Duplicate-claim resolution: when two files claim the same
+             episode (byte-identical playlists, near-identical content),
+             the higher-confidence file keeps the rename and the others go
+             to Extras. No silent wrong-slot rename.
+        Otherwise we trust the LLM's per-file choice and rename in place."""
         nonlocal renamed, dryrun, renamed_blind, skipped_target_exists, errors
         pending = folder_pending.pop(folder_key, [])
         if not pending:
             return
         show, season = folder_show_season.pop(folder_key, (pending[0]["show"], pending[0]["season"]))
 
-        # Pull TMDB episode list for runtime range + title lookup on override.
-        tmdb_eps: List[TmdbEpisode] = []
-        if tmdb_client is not None:
-            try:
-                tv_id = tmdb_client.find_tv_id(show)
-                if tv_id:
-                    tmdb_eps = tmdb_client.get_season_episodes(tv_id, season) or []
-            except Exception as e:
-                if verbose:
-                    print(f"[RECONCILE] TMDB season fetch failed for {show!r} S{season:02d}: {e}")
+        tmdb_eps: List[TmdbEpisode] = _get_tmdb_eps(show, season) or []
 
         runtimes = [e.runtime for e in tmdb_eps if e.runtime]
         if runtimes:
@@ -1719,7 +2010,6 @@ def main():
                     print(f"[EXTRA-RANGE] {entry['mkv'].name} {d:.1f}m outside season runtime "
                           f"range [{r_min:.1f}, {r_max:.1f}]m -> Extras")
                 extras_queue.append((entry["mkv"], show, season))
-                # Also free its claim so we don't block a future legitimate ID.
                 claim = (show.lower(), season, entry["proposed_ep"])
                 if episode_claims.get(claim) == entry["mkv"]:
                     episode_claims.pop(claim, None)
@@ -1729,237 +2019,49 @@ def main():
         if not episode_entries:
             return
 
-        episode_entries.sort(key=lambda e: e["mkv"].name)
+        # Duplicate-claim resolution: group by proposed episode_number.
+        # Within each group, the highest-confidence file wins; others go to
+        # Extras. Settles the byte-identical-playlist case where the LLM
+        # gives both files the same episode number with the same evidence.
+        by_ep: Dict[int, List[Dict[str, Any]]] = {}
+        for entry in episode_entries:
+            by_ep.setdefault(entry["proposed_ep"], []).append(entry)
 
-        # Drop Phase 1 outliers via median + MAD. A file whose proposed
-        # episode sits far outside the rest of the folder's proposals is
-        # almost certainly an alt-cut, commentary track, or otherwise extra
-        # whose content fooled the LLM into a different-season slot. Keeping
-        # it in pending forces the offset search to fit it, which can shift
-        # the rest of the folder off by one and drop the highest episode.
-        if len(episode_entries) >= 4:
-            props_for_med = sorted(e["proposed_ep"] for e in episode_entries)
-            mid = len(props_for_med) // 2
-            median_prop = props_for_med[mid]
-            mad_sorted = sorted(abs(e["proposed_ep"] - median_prop) for e in episode_entries)
-            mad = mad_sorted[mid]
-            if mad > 0:
-                kept_entries: List[Dict[str, Any]] = []
-                for entry in episode_entries:
-                    mod_z = abs(entry["proposed_ep"] - median_prop) / (1.4826 * mad)
-                    if mod_z > 3.5:
-                        print(f"[EXTRA-OUTLIER] {entry['mkv'].name} Phase 1 said "
-                              f"S{season:02d}E{entry['proposed_ep']:02d} — far from "
-                              f"folder median E{median_prop:02d}, routing to Extras")
-                        extras_queue.append((entry["mkv"], show, season))
-                        claim = (show.lower(), season, entry["proposed_ep"])
-                        if episode_claims.get(claim) == entry["mkv"]:
-                            episode_claims.pop(claim, None)
-                    else:
-                        kept_entries.append(entry)
-                episode_entries = kept_entries
+        winners: List[Dict[str, Any]] = []
+        for ep_num, group in by_ep.items():
+            if len(group) == 1:
+                winners.append(group[0])
+                continue
+            group.sort(key=lambda e: (-float(e.get("confidence", 0.0)),
+                                       e["mkv"].name))
+            winner = group[0]
+            winners.append(winner)
+            for loser in group[1:]:
+                print(f"[DUP   ] {loser['mkv'].name} also claimed "
+                      f"S{season:02d}E{ep_num:02d} (conf={float(loser.get('confidence', 0.0)):.2f}) "
+                      f"— losing to {winner['mkv'].name} "
+                      f"(conf={float(winner.get('confidence', 0.0)):.2f}), routing to Extras")
+                extras_queue.append((loser["mkv"], show, season))
+                claim = (show.lower(), season, ep_num)
+                # Only clear the claim if it was held by the loser; the
+                # winner will re-claim it below via _do_rename.
+                if episode_claims.get(claim) == loser["mkv"]:
+                    episode_claims.pop(claim, None)
 
-        if not episode_entries:
-            return
+        # Sort by episode number so the log reads naturally.
+        winners.sort(key=lambda e: e["proposed_ep"])
 
-        # Shortcut: if Phase 1's IDs (after outlier removal) form a contiguous
-        # episode run when sorted, Phase 1 is internally self-consistent — the
-        # LLM correctly identified the set of episodes, even if disc filename
-        # order doesn't match episode order. But "internally consistent" is not
-        # the same as "correct" — the LLM can be systematically off by N across
-        # a whole disc, with every individual ID title-matching TMDB. The
-        # synopsis cross-check below catches that: each file votes for a shift
-        # by comparing its evidence against the plot synopses of nearby
-        # episodes. Consensus shift wins.
-        if len(episode_entries) >= 2:
-            sorted_proposed = sorted(e["proposed_ep"] for e in episode_entries)
-            if sorted_proposed[-1] - sorted_proposed[0] == len(sorted_proposed) - 1 \
-                    and all(e["confidence"] >= 0.85 for e in episode_entries):
-                max_canon_for_shift = max((e.episode_number for e in tmdb_eps), default=0)
-                consensus_shift = _synopsis_consensus_shift(
-                    folder_key, episode_entries, tmdb_eps, max_canon_for_shift
-                )
-                # consensus_shift is None = couldn't run check; "refuse" = check
-                # said Phase 1 broadly wrong; int = apply this shift (may be 0).
-                if consensus_shift is None:
-                    print(f"[RECONCILE] folder {folder_key!r}: Phase 1 IDs form contiguous "
-                          f"run E{sorted_proposed[0]:02d}-E{sorted_proposed[-1]:02d} "
-                          f"(synopsis check unavailable) — trusting Phase 1 as-is")
-                    _apply_reconciled_renames(folder_key, show, season, episode_entries,
-                                              [e["proposed_ep"] for e in episode_entries],
-                                              tmdb_eps)
-                    return
-                if consensus_shift == "refuse":
-                    print(f"[SYNOPSIS] folder {folder_key!r}: synopsis check rejected the "
-                          f"contiguous run — falling through to file-order offset search")
-                    # do NOT return; fall through to the offset-search path below
-                else:
-                    shifted = [e["proposed_ep"] + consensus_shift for e in episode_entries]
-                    if any(a < 1 or a > max_canon_for_shift for a in shifted):
-                        print(f"[SYNOPSIS] folder {folder_key!r}: consensus shift "
-                              f"{consensus_shift:+d} would place episodes outside the "
-                              f"season — falling through to offset search")
-                    else:
-                        if consensus_shift == 0:
-                            print(f"[RECONCILE] folder {folder_key!r}: Phase 1 IDs form "
-                                  f"contiguous run E{sorted_proposed[0]:02d}-"
-                                  f"E{sorted_proposed[-1]:02d}, synopsis check confirms — "
-                                  f"trusting per-file assignments")
-                        else:
-                            new_lo = sorted_proposed[0] + consensus_shift
-                            new_hi = sorted_proposed[-1] + consensus_shift
-                            print(f"[RECONCILE] folder {folder_key!r}: Phase 1 said "
-                                  f"E{sorted_proposed[0]:02d}-E{sorted_proposed[-1]:02d}, "
-                                  f"synopsis consensus shifts run to E{new_lo:02d}-"
-                                  f"E{new_hi:02d} (shift {consensus_shift:+d})")
-                        _apply_reconciled_renames(folder_key, show, season, episode_entries,
-                                                  shifted, tmdb_eps)
-                        return
+        if verbose:
+            ep_list = ", ".join(f"E{e['proposed_ep']:02d}" for e in winners)
+            print(f"[RECONCILE] folder {folder_key!r}: {len(winners)} file(s) to rename "
+                  f"({ep_list})")
 
-        proposed = [e["proposed_ep"] for e in episode_entries]
-        n = len(episode_entries)
-
-        # Anchors: Phase 1 entries we trust enough to pin the offset. We accept
-        # any conf >= 0.85; TMDB-confirmed-without-correction is given extra
-        # weight inside the score function below.
-        anchors_idx = [i for i, e in enumerate(episode_entries)
-                       if e["confidence"] >= 0.85]
-        if not anchors_idx:
-            print(f"[RECONCILE] folder {folder_key!r}: no high-confidence anchor — "
-                  f"refusing to guess offset, files left in place")
-            return
-
-        # Search every plausible starting episode and score how well it
-        # agrees with anchors + runtimes.
-        max_canon = max((e.episode_number for e in tmdb_eps), default=0) or (max(proposed) + n)
-        search_lo = 1
-        search_hi = max(1, max_canon - n + 1)
-
-        def _score(start: int) -> Tuple[int, float]:
-            anchor_score = 0
-            runtime_bonus = 0.0
-            for i, entry in enumerate(episode_entries):
-                expected = start + i
-                if expected == entry["proposed_ep"]:
-                    pts = int(round(entry["confidence"] * 100))
-                    if entry.get("tmdb_confirmed_clean"):
-                        pts += 20  # extra weight for TMDB-clean confirmations
-                    anchor_score += pts
-                if tmdb_eps and entry["dur_m"] is not None:
-                    ep_obj = next((x for x in tmdb_eps if x.episode_number == expected), None)
-                    if ep_obj and ep_obj.runtime and abs(ep_obj.runtime - entry["dur_m"]) <= 3.0:
-                        runtime_bonus += 5.0
-            return anchor_score, runtime_bonus
-
-        best_start = None
-        best_score = (-1, -1.0)
-        second_start = None
-        second_score = (-1, -1.0)
-        for start in range(search_lo, search_hi + 1):
-            s = _score(start)
-            if s > best_score:
-                second_score = best_score
-                second_start = best_start
-                best_score = s
-                best_start = start
-            elif s > second_score:
-                second_score = s
-                second_start = start
-
-        if best_start is None:
-            print(f"[RECONCILE] folder {folder_key!r}: no plausible offset, files left in place")
-            return
-
-        anchor_pts, runtime_pts = best_score
-        print(f"[RECONCILE] folder {folder_key!r}: best offset E{best_start:02d} "
-              f"(anchor_score={anchor_pts} runtime_bonus={runtime_pts:.0f}, {n} file(s))")
-
-        # Synopsis validation: run the same cross-check used on the shortcut
-        # path, but centred on the offset-search winner rather than Phase 1's
-        # proposed episodes. Catches the case where N clustered-but-wrong Phase
-        # 1 anchors outscore a single correct anchor (e.g. E10-E13 beats E01).
-        validated_start = best_start
-        if tmdb_eps and any(e.get("evidence_text") for e in episode_entries):
-            max_canon_os = max((e.episode_number for e in tmdb_eps), default=0)
-            search_ceil = max(1, max_canon_os - n + 1)
-
-            def _synopsis_validate(candidate_start: int) -> Any:
-                """Return _synopsis_consensus_shift result for a given offset."""
-                tmp_entries = [
-                    dict(e, proposed_ep=candidate_start + idx)
-                    for idx, e in enumerate(episode_entries)
-                ]
-                return _synopsis_consensus_shift(
-                    folder_key, tmp_entries, tmdb_eps, max_canon_os
-                )
-
-            result = _synopsis_validate(best_start)
-            if result is None:
-                pass  # no synopses or no evidence — can't check, keep best_start
-            elif result == "refuse":
-                if second_start is not None:
-                    print(f"[SYNOPSIS] folder {folder_key!r}: synopsis rejects anchor-score "
-                          f"winner E{best_start:02d} — trying runner-up E{second_start:02d}")
-                    result2 = _synopsis_validate(second_start)
-                    if result2 is None or result2 == "refuse":
-                        print(f"[SYNOPSIS] folder {folder_key!r}: runner-up E{second_start:02d} "
-                              f"also rejected — refusing to rename folder")
-                        return
-                    shift2 = result2 if isinstance(result2, int) else 0
-                    new_s = second_start + shift2
-                    if 1 <= new_s <= search_ceil:
-                        print(f"[SYNOPSIS] folder {folder_key!r}: runner-up E{second_start:02d} "
-                              f"confirmed (shift {shift2:+d}) — using E{new_s:02d}")
-                        validated_start = new_s
-                    else:
-                        print(f"[SYNOPSIS] folder {folder_key!r}: runner-up shift out of range "
-                              f"— refusing to rename folder")
-                        return
-                else:
-                    print(f"[SYNOPSIS] folder {folder_key!r}: synopsis rejects "
-                          f"E{best_start:02d} and no runner-up available — refusing to rename")
-                    return
-            else:
-                shift = result
-                new_s = best_start + shift
-                if 1 <= new_s <= search_ceil:
-                    if shift != 0:
-                        print(f"[SYNOPSIS] folder {folder_key!r}: synopsis shifts offset "
-                              f"from E{best_start:02d} to E{new_s:02d} (shift {shift:+d})")
-                    else:
-                        print(f"[SYNOPSIS] folder {folder_key!r}: synopsis confirms "
-                              f"offset E{best_start:02d}")
-                    validated_start = new_s
-                else:
-                    print(f"[SYNOPSIS] folder {folder_key!r}: synopsis shift out of range "
-                          f"— keeping anchor-score offset E{best_start:02d}")
-
-        _apply_reconciled_renames(folder_key, show, season, episode_entries,
-                                  [validated_start + i for i in range(n)], tmdb_eps)
-
-    def _apply_reconciled_renames(folder_key: str, show: str, season: int,
-                                   entries: List[Dict[str, Any]],
-                                   assigned_eps: List[int],
-                                   tmdb_eps: List[TmdbEpisode]) -> None:
-        nonlocal renamed, dryrun, renamed_blind, skipped_target_exists
-        # Drop stale claims from Phase 1 for this (show, season) before we
-        # rebuild them from the reconciled assignments.
-        stale = [k for k in episode_claims
-                 if k[0] == show.lower() and k[1] == season]
-        for k in stale:
-            episode_claims.pop(k, None)
-
-        for entry, assigned_ep in zip(entries, assigned_eps):
+        for entry in winners:
+            assigned_ep = entry["proposed_ep"]
             assigned_title = entry["proposed_title"]
             ep_obj = next((x for x in tmdb_eps if x.episode_number == assigned_ep), None)
             if ep_obj:
                 assigned_title = ep_obj.name
-
-            if assigned_ep != entry["proposed_ep"]:
-                print(f"[OVERRIDE] {entry['mkv'].name}: Phase 1 said "
-                      f"S{season:02d}E{entry['proposed_ep']:02d} \"{entry['proposed_title']}\" "
-                      f"-> reconciled to S{season:02d}E{assigned_ep:02d} \"{assigned_title}\" "
-                      f"(order)")
 
             ok = rename_and_move(entry["mkv"], show, season, assigned_ep,
                                  assigned_title, args.dry_run, dest_root)
@@ -1978,7 +2080,7 @@ def main():
                     renamed += 1
                     if entry.get("is_blind"):
                         renamed_blind += 1
-                print(f"[DONE ] renamed (reconciled)")
+                print(f"[DONE ] renamed S{season:02d}E{assigned_ep:02d} \"{assigned_title}\"")
             else:
                 skipped_target_exists += 1
                 print(f"[SKIP ] target exists / rename not performed: "
@@ -2144,19 +2246,20 @@ def main():
 
         evidence_text = None
         evidence_kind = None
-        subtitle_windows: Optional[List[Tuple[str, str]]] = None
 
         if not (streams and subtitles_are_bitmap_only(streams)):
-            # Extract both the concatenated excerpt (single-call fallback path)
-            # and the separate windows (multi-window voting path, bug 152).
-            subtitle_excerpt = extract_subtitle_excerpt(mkv, max_lines=args.max_sub_lines)
-            subtitle_windows = extract_subtitle_windows(mkv, max_lines=args.max_sub_lines)
-            if subtitle_excerpt:
-                evidence_text = subtitle_excerpt
-                evidence_kind = "subtitle excerpt"
+            # Bug 152 rewrite: pull the full post-intro dialogue (no
+            # windowing, no 4K-char cap) as a single block. The
+            # season-match identifier sees ~10-15K chars of actual plot
+            # beats per file, plenty to disambiguate against the season's
+            # 22 synopses in one constrained-choice LLM call.
+            subtitle_full = extract_subtitle_full(mkv)
+            if subtitle_full:
+                evidence_text = subtitle_full
+                evidence_kind = "subtitle (full post-intro dialogue)"
                 used_subtitles += 1
                 if verbose:
-                    print(f"[EVID ] subtitles -> \"{one_line(subtitle_excerpt)}\"")
+                    print(f"[EVID ] subtitle full ({len(subtitle_full)} chars)")
 
         def clamp_clip_start(requested_start: float, duration_seconds: float) -> Optional[float]:
             latest_start = max(0.0, dur_s - duration_seconds - 1.0)
@@ -2396,6 +2499,74 @@ def main():
                 return False, result, fail_code
             return _phase1_finalize(stage, result, e_text, e_kind)
 
+        def attempt_season_match(e_text: str, e_kind: str,
+                                  tmdb_eps: List["TmdbEpisode"]
+                                  ) -> Tuple[bool, Optional[dict], str]:
+            """Bug 152 rewrite: identify the episode by giving the LLM the
+            full post-intro dialogue (or audio transcript) plus every TMDB
+            synopsis in the season, in one constrained-choice call. Skips
+            the old single-call Phase 1 + voting + synopsis-shift stack.
+
+            On success: feeds the result through TMDB verify + conflict
+            check + queue (same downstream as the legacy path) and persists
+            the LLM-produced summary to sort_hints.json so future runs of
+            the same file skip the LLM call entirely (size + mtime keyed)."""
+            nonlocal errors
+            try:
+                result = call_llm_match_against_season(
+                    llm_client, args.model, show, season, e_text, dur_m, e_kind,
+                    tmdb_eps, file_basename=mkv.name,
+                )
+            except DeepSeekAuthError:
+                raise
+            except Exception as e:
+                errors += 1
+                print(f"[ERR  ] season-match LLM call failed: {e}")
+                return False, None, "llm_error"
+
+            is_ep = bool(result.get("is_episode"))
+            conf = float(result.get("confidence", 0.0))
+            ep_num = result.get("episode_number")
+            ep_title = result.get("episode_title")
+            summary = result.get("summary") or ""
+
+            if verbose:
+                if is_ep and isinstance(ep_num, int) and ep_title:
+                    mark = "✓" if conf >= args.min_confidence else "✗"
+                    print(f"[MATCH] -> S{season:02d}E{ep_num:02d} \"{ep_title}\" (conf={conf:.2f}) {mark}")
+                else:
+                    print(f"[MATCH] -> non-episode/unknown (conf={conf:.2f}) ✗")
+                if summary:
+                    print(f"       summary: {one_line(summary, 200)}")
+                notes = one_line(result.get("notes", ""), 160)
+                if notes:
+                    print(f"       notes: {notes}")
+
+            if not is_ep:
+                return False, result, "non_episode"
+            if conf < args.min_confidence:
+                return False, result, "low_conf"
+            if not isinstance(ep_num, int) or not ep_title:
+                return False, result, "missing_fields"
+
+            # Persist the summary regardless of subsequent finalize outcome
+            # so reviewers can see what the LLM saw even when TMDB rejects.
+            try:
+                st = mkv.stat()
+                _save_file_summary(folder, mkv.parent, mkv.name, {
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "is_episode": True,
+                    "episode_number": ep_num,
+                    "episode_title": ep_title,
+                    "summary": summary,
+                    "confidence": conf,
+                })
+            except OSError:
+                pass
+
+            return _phase1_finalize("MATCH", result, e_text, e_kind)
+
         def attempt_llm_subtitle_vote(windows: List[Tuple[str, str]]
                                        ) -> Tuple[bool, Optional[dict], str]:
             """3b: Phase 1 LLM votes across independent subtitle windows.
@@ -2574,37 +2745,66 @@ def main():
                                           mkv.name, tmdb_confirmed_clean, conf)
                 return True, result, "queued"
 
-        # Multi-window voting (bug 152): when we have 3+ independent subtitle
-        # windows and we're NOT in blind mode (voting helpers are defined only
-        # for the hinted path), commit only on majority agreement across
-        # windows. A confidently-wrong identification on one window is one
-        # vote of three. Falls back to the single-call path when too few
-        # windows are available or evidence is audio-based.
-        used_vote = False
-        if subtitle_windows and len(subtitle_windows) >= 3 and not folder_parse_failed:
-            used_vote = True
-            renamed_ok, first_result, fail_code = attempt_llm_subtitle_vote(subtitle_windows)
+        # Bug 152 rewrite: primary identification is now "match the file's
+        # full evidence against every TMDB synopsis in the season, one call."
+        # The legacy single-call Phase 1 path is kept for blind mode and as a
+        # safety net when the TMDB episode list is unavailable.
+        used_match = False
+        used_cache = False
+        tmdb_eps_for_match: Optional[List[TmdbEpisode]] = None
+        if not folder_parse_failed and show and season:
+            tmdb_eps_for_match = _get_tmdb_eps(show, season)
+
+        # Try the cached file summary first — same-file re-runs skip the LLM
+        # entirely. Cache invalidation is size + mtime.
+        cached_entry = None
+        try:
+            _st = mkv.stat()
+            cached_entry = _load_cached_file_summary(folder, mkv.name,
+                                                     _st.st_size, _st.st_mtime)
+        except OSError:
+            cached_entry = None
+
+        if cached_entry and cached_entry.get("is_episode") \
+                and isinstance(cached_entry.get("episode_number"), int) \
+                and cached_entry.get("episode_title"):
+            used_cache = True
+            if verbose:
+                print(f"[CACHE] hit -> S{season:02d}E{cached_entry['episode_number']:02d} "
+                      f"\"{cached_entry['episode_title']}\" (from sort_hints.json)")
+            cached_result = {
+                "is_episode": True,
+                "episode_number": cached_entry["episode_number"],
+                "episode_title": cached_entry["episode_title"],
+                "confidence": float(cached_entry.get("confidence", 0.95)),
+                "summary": cached_entry.get("summary", ""),
+                "notes": "",
+            }
+            renamed_ok, first_result, fail_code = _phase1_finalize(
+                "CACHE", cached_result, evidence_text or "",
+                "cached identification (sort_hints.json file_summaries)"
+            )
+        elif tmdb_eps_for_match is not None and evidence_text is not None and not folder_parse_failed:
+            used_match = True
+            renamed_ok, first_result, fail_code = attempt_season_match(
+                evidence_text, evidence_kind, tmdb_eps_for_match
+            )
         else:
+            # Blind mode, or no TMDB episode list, or no evidence — legacy
+            # single-call path is the right fallback here.
             renamed_ok, first_result, fail_code = attempt_llm_with_evidence(
-                "PRIMARY", evidence_text, evidence_kind
+                "PRIMARY", evidence_text or "", evidence_kind or "unknown"
             )
 
         if renamed_ok:
-            print("[QUEUE] held for folder reconciliation"
-                  + (" (vote)" if used_vote else "")
-                  + (" (blind)" if folder_parse_failed else ""))
-            continue
-
-        # A no-majority vote should not fall through to other identification
-        # paths — silence is the right outcome until a human reviews the file.
-        if used_vote and fail_code == "vote_ambiguous":
-            skipped_low_conf += 1
-            print("[SKIP ] subtitle windows disagree — no majority, refusing to rename")
-            if dest_root and show and season:
-                extras_queue.append((mkv, show, season))
-            else:
-                skipped_files.append({"file": mkv.name,
-                                      "reason": "subtitle windows disagreed (vote ambiguous)"})
+            tag = ""
+            if used_cache:
+                tag = " (cached)"
+            elif used_match:
+                tag = " (match)"
+            elif folder_parse_failed:
+                tag = " (blind)"
+            print(f"[QUEUE] held for folder reconciliation{tag}")
             continue
 
         # Conflict: subtitle identified an already-claimed episode — retry with audio
