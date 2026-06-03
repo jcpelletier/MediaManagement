@@ -104,12 +104,13 @@ python Sort_TV.py --root /mnt/media/Video/Processed [flags]
 **Identification pipeline**
 
 1. Parse show + season from folder name via DeepSeek with regex fallback. Disc markers (`Disc 2`, `D2`, etc.) are stripped before parsing so they aren't mistaken for season numbers.
-2. Fetch episode guide (titles, runtimes, synopses) from TMDB for LLM context. Previously-identified episode numbers from sibling discs in the same show/season are passed as a "previous disc ended at E{N}" hint.
-3. Extract subtitle excerpt sampled at three timeline positions, skipping the first 5 minutes to avoid recurring intros / cold-open narration dominating the LLM context.
-4. If no subtitles: Whisper audio transcription (primary clip → second clip → deep fallback). Sample start offset gets per-call random jitter to de-correlate samples across episodes that share intro timing.
-5. DeepSeek identifies episode against the episode guide; TMDB verifies/corrects.
-6. Per-folder reconciliation (Phase 2): proposals are queued and reconciled against contiguousness + TMDB runtime range at the folder boundary — outliers get rejected and retried.
-7. Duplicate detection — if two files claim the same episode, the second retries with audio.
+2. Fetch the full episode guide (titles, runtimes, synopses) from TMDB for the season.
+3. Runtime-outlier check: files whose duration falls outside the season's TMDB runtime band are routed to `Extras/` before the LLM call, so menu loops and featurettes never enter the episode-claim queue.
+4. Extract the full post-intro subtitle dialogue (~10–15 K chars per episode, skipping the first 5 minutes to avoid recurring intros). `[Nm]` markers in the text indicate minutes into the episode for temporal context.
+5. If no subtitles: Whisper audio transcription (primary clip → second clip → deep fallback). Sample start offset gets per-call random jitter to de-correlate samples across episodes that share intro timing.
+6. Single constrained-choice LLM call: the full dialogue plus every episode's TMDB synopsis for the season are sent together. DeepSeek picks the episode whose synopsis best matches the specific plot beats, named characters, and events — not just the show's recurring tone — and returns `episode_number`, `episode_title`, a 2–3 sentence factual summary, and a confidence score. TMDB verifies/corrects the title.
+7. Per-file summary cached in `sort_hints.json` (`file_summaries` block, keyed by filename + size + mtime). Subsequent runs on the same file skip the LLM call entirely.
+8. Duplicate-claim resolution: when two files claim the same episode, the higher-confidence file keeps the rename and the other goes to `Extras/`.
 
 **Auto-written hints + sibling disc inheritance**
 
