@@ -1995,26 +1995,11 @@ def main():
 
         tmdb_eps: List[TmdbEpisode] = _get_tmdb_eps(show, season) or []
 
-        runtimes = [e.runtime for e in tmdb_eps if e.runtime]
-        if runtimes:
-            r_min = min(runtimes) * 0.8
-            r_max = max(runtimes) * 1.2
-        else:
-            r_min = r_max = None
-
-        episode_entries: List[Dict[str, Any]] = []
-        for entry in pending:
-            d = entry["dur_m"]
-            if r_min is not None and r_max is not None and d is not None and (d < r_min or d > r_max):
-                if verbose:
-                    print(f"[EXTRA-RANGE] {entry['mkv'].name} {d:.1f}m outside season runtime "
-                          f"range [{r_min:.1f}, {r_max:.1f}]m -> Extras")
-                extras_queue.append((entry["mkv"], show, season))
-                claim = (show.lower(), season, entry["proposed_ep"])
-                if episode_claims.get(claim) == entry["mkv"]:
-                    episode_claims.pop(claim, None)
-            else:
-                episode_entries.append(entry)
+        # Runtime-outlier filter now runs as an EARLY per-file check before
+        # the LLM call (see main loop), so by the time we get here every
+        # pending entry already fits the season runtime band. Just take
+        # what's queued.
+        episode_entries: List[Dict[str, Any]] = list(pending)
 
         if not episode_entries:
             return
@@ -2184,6 +2169,32 @@ def main():
             if dest_root and show and season:
                 extras_queue.append((mkv, show, season))
             continue
+
+        # Early season-runtime-band filter: when we know the show/season and
+        # TMDB tells us the episode runtime range, route out-of-band files
+        # straight to Extras BEFORE the per-file LLM call. Without this,
+        # an outlier (e.g. the 28.6m extended Pilot in a season whose
+        # canonical runtime is 22m) can be processed first, claim an
+        # episode slot, and then get evicted at folder flush — leaving the
+        # in-band file that lost the conflict permanently skipped and the
+        # episode slot empty (build #68 lost E01 to this exact sequence).
+        if show and season and not folder_parse_failed:
+            _band_eps = _get_tmdb_eps(show, season)
+            if _band_eps:
+                _runtimes = [e.runtime for e in _band_eps if e.runtime]
+                if _runtimes:
+                    _r_min = min(_runtimes) * 0.8
+                    _r_max = max(_runtimes) * 1.2
+                    if dur_m < _r_min or dur_m > _r_max:
+                        skipped_duration_range += 1
+                        print(f"[EXTRA-RANGE] {dur_m:.1f}m outside season runtime "
+                              f"range [{_r_min:.1f}, {_r_max:.1f}]m -> Extras")
+                        if dest_root:
+                            extras_queue.append((mkv, show, season))
+                        else:
+                            skipped_files.append({"file": mkv.name,
+                                                  "reason": f"runtime {dur_m:.1f}m outside season range"})
+                        continue
 
         # Fetch episode guide from TMDB (cached per show+season) for LLM context
         episode_guide: Optional[str] = None
