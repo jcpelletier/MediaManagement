@@ -21,12 +21,12 @@ Shell scripts triggered by udev when a disc is inserted. Deployed to `/opt/rip/`
 ### Deploy
 
 ```bash
-ssh panda "sudo git -C /opt/MediaManagement pull && sudo bash /opt/MediaManagement/rip/install.sh"
+sudo git -C /opt/MediaManagement pull && sudo bash /opt/MediaManagement/rip/install.sh
 ```
 
 On first setup, clone the repo first:
 ```bash
-ssh panda "sudo git clone https://github.com/jcpelletier/MediaManagement.git /opt/MediaManagement && sudo bash /opt/MediaManagement/rip/install.sh"
+sudo git clone https://github.com/jcpelletier/MediaManagement.git /opt/MediaManagement && sudo bash /opt/MediaManagement/rip/install.sh
 ```
 
 ### rip-video.sh
