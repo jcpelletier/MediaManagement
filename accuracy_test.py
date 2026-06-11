@@ -209,7 +209,10 @@ def harvest_shows(shows_root: Path) -> List[Season]:
             if season_dir.name.lower() == "extras":
                 continue
             for f in sorted(season_dir.iterdir()):
-                if not f.is_file() or f.suffix.lower() != ".mkv":
+                # Accept any video container (the library is mostly .mp4). They are
+                # staged as .mkv-named hardlinks below; ffprobe/ffmpeg detect format
+                # from content, not extension, so Sort_TV processes them unchanged.
+                if not f.is_file() or f.suffix.lower() not in VIDEO_EXTS:
                     continue
                 em = EPISODE_RE.match(f.name)
                 if not em:
