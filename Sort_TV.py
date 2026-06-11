@@ -896,7 +896,8 @@ Evidence text:
 
 
 def build_blind_prompt(evidence_text: str, duration_minutes: float, evidence_kind: str,
-                       disc_context: Optional[List[str]] = None) -> str:
+                       disc_context: Optional[List[str]] = None,
+                       folder_name: Optional[str] = None) -> str:
     """Prompt used when no show/season hint is available from the folder name.
     Claude must identify the show, season, and episode entirely from content."""
 
@@ -921,9 +922,15 @@ def build_blind_prompt(evidence_text: str, duration_minutes: float, evidence_kin
             + ordering_hint
         )
 
+    folder_section = (
+        f"Folder name: {folder_name} (could not be fully parsed — treat as a hint only, not authoritative)\n"
+        if folder_name else
+        "No folder name is available.\n"
+    )
+
     return f"""You are identifying video content for file renaming.
 
-No folder name is available. Identify the content entirely from the evidence below.
+{folder_section}Identify the content from the evidence below.
 
 FILE INFO:
 - Duration: {duration_minutes:.1f} minutes
@@ -1011,8 +1018,10 @@ def call_llm_identify_blind(
     duration_minutes: float,
     evidence_kind: str,
     disc_context: Optional[List[str]] = None,
+    folder_name: Optional[str] = None,
 ) -> dict:
-    """Blind identification — no show/season hints. Claude infers everything from content."""
+    """Blind identification — no show/season hints from parsing. Claude infers everything from content,
+    optionally aided by the raw folder name when the parser couldn't extract show+season from it."""
     class _EpisodeIDBlind(BaseModel):
         is_episode: bool
         show: Optional[str] = None
@@ -1023,7 +1032,7 @@ def call_llm_identify_blind(
         notes: str = ""
 
     prompt = build_blind_prompt(evidence_text, duration_minutes, evidence_kind,
-                               disc_context=disc_context)
+                               disc_context=disc_context, folder_name=folder_name)
 
     result = client.parse(
         system="Return only the structured JSON result matching the schema.",
@@ -2645,7 +2654,8 @@ def main():
                 nonlocal errors, renamed_blind
                 try:
                     result = call_llm_identify_blind(llm_client, args.blind_model, e_text, dur_m, e_kind,
-                                                    disc_context=list(disc_context_list) or None)
+                                                    disc_context=list(disc_context_list) or None,
+                                                    folder_name=folder or None)
                 except DeepSeekAuthError:
                     raise  # fatal, run-wide — abort instead of silently skipping
                 except Exception as e:
