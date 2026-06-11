@@ -18,6 +18,7 @@ convert, and manage the media library on the server.
 | `Sort_TV.py` | Process_Movies | TV episode sorting |
 | `Fetch_Subs.py` | Nightly_Convert | Fetches subtitle files |
 | `AudioSync_Subs.py` | Nightly_Convert | Subtitle audio sync |
+| `accuracy_test.py` | Sort_Accuracy_Test (manual) | Measures Sort_Rips/Sort_TV identification accuracy against the library via obfuscated hardlink staging |
 
 ## Key rules
 

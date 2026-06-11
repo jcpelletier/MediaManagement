@@ -161,3 +161,63 @@ Downloads subtitles from OpenSubtitles for `.mp4` files. Requires `OPENSUB_API_K
 ```bash
 python Fetch_Subs.py /path/to/video_or_directory [name_filter]
 ```
+
+### accuracy_test.py
+
+Measures how accurately `Sort_Rips.py` and `Sort_TV.py` identify content. The library
+under `/mnt/media/Media/{Movies,Shows}` is already correctly named, so it doubles as a
+labeled ground-truth set. The test feeds the **real media bytes** through the **real
+sorters** but with folder/file names replaced by obfuscated stand-ins, then compares each
+decision against the known-correct library name.
+
+It is safe to run against the live library: staging holds only **hardlinks** (symlink
+fallback) to the real files, so the sorters only ever rename/move the *links* — the
+originals are never touched. Decisions are mapped back to ground truth by **inode
+identity** (a hardlink shares the target's inode), so no edits to the sorters are needed.
+
+**Obfuscation indexes**
+
+| | Sort_Rips (movies) | Sort_TV (episodes) |
+|---|---|---|
+| Index 1 | folder vaguely hints title (`MENINBLACK` / `MIBMOVIE`) | `<SHOW>_SEASON<N>_DISC<k>` (show + season) |
+| Index 2 | constant `MOVIEFOLDER_<NNN>` (no hint) | `<SHOW>_DISC<k>` (show, no season) |
+| Index 3 | — | random token per disc (fully blind) |
+
+Seasons are split into discs of `--episodes-per-disc` (default 4) with episodes sequential
+only within a disc, mirroring real MakeMKV rips. File names are randomized (ordered within
+a disc to match episode order). Extras are not tested.
+
+**Usage**
+```bash
+python3 accuracy_test.py \
+  --media-root /mnt/media/Media \
+  --staging-root /mnt/media/.accuracy_test \
+  [--limit N] \           # N movies AND N episodes; omit for ALL
+  [--only rips|tv|both] [--indexes 1,2,3] \
+  [--episodes-per-disc 4] [--no-audio-fallback] \
+  --summary-json /tmp/accuracy_test_summary.json
+```
+
+`--staging-root` must be on the **same volume** as the media (hardlinks). The test is
+report-only — it prints a per-index accuracy table, writes the summary JSON, and always
+exits 0 (non-zero only on harness errors). It makes one LLM call + subtitle/audio
+extraction per file per index, so use `--limit` to bound cost when iterating.
+
+**Jenkins job (manual trigger)**
+
+Create a freestyle job `Sort_Accuracy_Test` (Jenkins UI) with a string parameter
+`SAMPLE_SIZE` (blank = ALL) and an optional `EPISODES_PER_DISC`. Build step:
+```bash
+python3 "$WORKSPACE/accuracy_test.py" \
+  --media-root /mnt/media/Media \
+  --staging-root /mnt/media/.accuracy_test \
+  ${SAMPLE_SIZE:+--limit $SAMPLE_SIZE} \
+  ${EPISODES_PER_DISC:+--episodes-per-disc $EPISODES_PER_DISC} \
+  --summary-json /tmp/accuracy_test_summary.json
+```
+Post-build shell:
+```bash
+bash "$WORKSPACE/accuracy-test-notify.sh" \
+  "$JOB_NAME" "$BUILD_RESULT" "$BUILD_NUMBER" "$BUILD_URL" \
+  /tmp/accuracy_test_summary.json
+```
