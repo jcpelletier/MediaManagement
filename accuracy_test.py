@@ -77,6 +77,19 @@ except Exception:  # pragma: no cover - import side effects only matter on panda
 
 TITLE_MATCH_THRESHOLD = 0.90
 VIDEO_EXTS = {e.lower() for e in DEFAULT_EXTENSIONS}
+
+# Human-readable labels for the obfuscation pattern each index applies. Kept in
+# sync with the staging functions (stage_movies / stage_tv) so the Jenkins log
+# explains what each index actually tests.
+RIPS_PATTERNS = {
+    1: "folder hints title (e.g. MENINBLACK / MIBMOVIE)",
+    2: "folder constant MOVIEFOLDER_NNN (no hint)",
+}
+TV_PATTERNS = {
+    1: "show + season in folder name",
+    2: "show in folder name, season hidden",
+    3: "fully blind (random folder token, no show/season)",
+}
 EPISODE_RE = re.compile(
     r"^(?P<show>.+?)\s*-\s*S(?P<s>\d{1,2})E(?P<e>\d{1,3})\s*-\s*(?P<title>.+)\.(?P<ext>[A-Za-z0-9]+)$"
 )
@@ -465,6 +478,7 @@ def score_tv(keymap: Dict[Tuple[int, int], EpisodeGT], out_dir: Path,
     episode_correct = season_correct = wrong = extras = miss = unmapped = 0
     for key, gt in keymap.items():
         row = {"show": gt.show, "season": gt.season, "episode": gt.episode,
+               "gt_title": gt.title,
                "id_season": None, "id_episode": None,
                "correct_season": False, "correct_episode": False, "outcome": ""}
         info = identified.get(key)
@@ -506,24 +520,99 @@ def score_tv(keymap: Dict[Tuple[int, int], EpisodeGT], out_dir: Path,
 
 # ---------------------------- report ----------------------------
 
+def _fmt_movie_gt(row: dict) -> str:
+    year = f" ({row['gt_year']})" if row.get("gt_year") else ""
+    return f"{row['gt_title']}{year}"
+
+
+def _fmt_episode_gt(row: dict) -> str:
+    title = row.get("gt_title") or ""
+    suffix = f' "{title}"' if title else ""
+    return f"{row['show']} S{row['season']:02d}E{row['episode']:02d}{suffix}"
+
+
+def _print_rips_failures(items: List[dict]) -> None:
+    buckets = {"wrong_title": [], "unidentified": [], "unmapped": []}
+    for row in items:
+        if row["outcome"] == "correct":
+            continue
+        if row["outcome"] in buckets:
+            buckets[row["outcome"]].append(row)
+    labels = {
+        "wrong_title": "wrong title",
+        "unidentified": "unidentified (left in source / processed)",
+        "unmapped": "unmapped (vanished — neither in output nor source)",
+    }
+    for outcome, label in labels.items():
+        rows = buckets[outcome]
+        if not rows:
+            continue
+        print(f"  {label}:")
+        for row in rows:
+            got = row.get("identified") or "(no folder)"
+            print(f"    - {_fmt_movie_gt(row)}  ->  got: {got}")
+
+
+def _print_tv_failures(items: List[dict]) -> None:
+    buckets = {
+        "wrong_episode": [],
+        "routed_to_extras": [],
+        "unidentified": [],
+        "unmapped": [],
+    }
+    for row in items:
+        if row["outcome"] == "correct":
+            continue
+        if row["outcome"] in buckets:
+            buckets[row["outcome"]].append(row)
+    labels = {
+        "wrong_episode": "wrong episode / season",
+        "routed_to_extras": "routed to extras (sorter saw episode as non-episode)",
+        "unidentified": "unidentified (left in source — TMDB verify failed or no usable evidence)",
+        "unmapped": "unmapped (vanished — neither in output nor source)",
+    }
+    for outcome, label in labels.items():
+        rows = buckets[outcome]
+        if not rows:
+            continue
+        print(f"  {label}:")
+        for row in rows:
+            if outcome == "wrong_episode":
+                got = f"got S{row['id_season']:02d}E{row['id_episode']:02d}"
+            else:
+                got = ""
+            line = f"    - {_fmt_episode_gt(row)}"
+            if got:
+                line += f"  ->  {got}"
+            print(line)
+
+
 def print_report(results: dict) -> None:
     print("\n" + "=" * 64)
     print("ACCURACY REPORT")
+    print("Each suite/index reflects a different obfuscation pattern. The")
+    print("real media bytes are unchanged; only folder/file names vary.")
     print("=" * 64)
     rips = results.get("rips", {})
     for idx in sorted(rips):
         r = rips[idx]
         t = r["total"]
-        print(f"Sort_Rips Index {idx}: title {r['title_correct']}/{t} ({pct(r['title_correct'], t)})  "
+        pattern = RIPS_PATTERNS.get(int(idx), "unknown pattern")
+        print(f"Sort_Rips Index {idx} ({pattern}):")
+        print(f"  title {r['title_correct']}/{t} ({pct(r['title_correct'], t)})  "
               f"title+year {r['title_year_correct']}/{t}  wrong {r['wrong']}  miss {r['miss']}"
               + (f"  unmapped {r['unmapped']}" if r['unmapped'] else ""))
+        _print_rips_failures(r.get("items", []))
     tv = results.get("tv", {})
     for idx in sorted(tv):
         r = tv[idx]
         t = r["total"]
-        print(f"Sort_TV   Index {idx}: episode {r['episode_correct']}/{t} ({pct(r['episode_correct'], t)})  "
+        pattern = TV_PATTERNS.get(int(idx), "unknown pattern")
+        print(f"Sort_TV   Index {idx} ({pattern}):")
+        print(f"  episode {r['episode_correct']}/{t} ({pct(r['episode_correct'], t)})  "
               f"season {r['season_correct']}/{t}  wrong {r['wrong']}  extras {r['extras']}  miss {r['miss']}"
               + (f"  unmapped {r['unmapped']}" if r['unmapped'] else ""))
+        _print_tv_failures(r.get("items", []))
     print("=" * 64 + "\n")
 
 
@@ -595,7 +684,8 @@ def main() -> int:
                 proc = run_dir / f"proc_rips_idx{idx}"
                 summ = run_dir / f"rips_idx{idx}_summary.json"
                 keymap, mode = stage_movies(sampled, src, idx, args.link_mode, rng)
-                print(f"[RIPS] Index {idx}: staged {len(keymap)} movies ({mode}).")
+                pattern = RIPS_PATTERNS.get(idx, "unknown pattern")
+                print(f"[RIPS] Index {idx} ({pattern}): staged {len(keymap)} movies ({mode}).")
                 run_sort_rips(src, out, proc, args.no_audio_fallback, summ)
                 results["rips"][str(idx)] = score_rips(keymap, out, [src, proc])
 
@@ -611,7 +701,8 @@ def main() -> int:
                 out = run_dir / f"out_tv_idx{idx}"
                 summ = run_dir / f"tv_idx{idx}_summary.json"
                 keymap, mode = stage_tv(sampled, src, idx, eps_per_disc, args.link_mode, rng)
-                print(f"[TV] Index {idx}: staged {len(keymap)} episodes ({mode}).")
+                pattern = TV_PATTERNS.get(idx, "unknown pattern")
+                print(f"[TV] Index {idx} ({pattern}): staged {len(keymap)} episodes ({mode}).")
                 run_sort_tv(src, out, args.no_audio_fallback, summ)
                 results["tv"][str(idx)] = score_tv(keymap, out, [src])
 
