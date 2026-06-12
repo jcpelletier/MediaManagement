@@ -342,16 +342,29 @@ def stage_tv(seasons: List[Season], dest_dir: Path, index: int, eps_per_disc: in
 
 # ---------------------------- run sorters ----------------------------
 
-def run_subprocess(cmd: List[str]) -> int:
-    print(f"\n$ {' '.join(cmd)}", flush=True)
-    proc = subprocess.run(cmd, cwd=str(SCRIPT_DIR))
-    if proc.returncode != 0:
-        print(f"[WARN ] sub-process exited {proc.returncode}: {cmd[1] if len(cmd) > 1 else cmd}", flush=True)
+def child_env(threads: int) -> dict:
+    """Cap each sorter's CPU-Whisper thread count so several can run concurrently
+    without oversubscribing the cores. The sorters build WhisperModel with the
+    default cpu_threads, which ctranslate2 derives from OMP_NUM_THREADS."""
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(max(1, threads))
+    return env
+
+
+def run_subprocess(cmd: List[str], log_path: Path, env: Optional[dict]) -> int:
+    """Run a sorter, capturing its output to log_path (parallel passes would
+    otherwise interleave unreadably). Returns the exit code."""
+    with open(log_path, "w", encoding="utf-8", errors="replace") as lf:
+        lf.write("$ " + " ".join(cmd) + "\n")
+        lf.flush()
+        proc = subprocess.run(cmd, cwd=str(SCRIPT_DIR), env=env,
+                              stdout=lf, stderr=subprocess.STDOUT)
     return proc.returncode
 
 
 def run_sort_rips(source: Path, dest: Path, processed: Path, no_audio: bool,
-                  summary_json: Path) -> None:
+                  summary_json: Path, whisper_model: Optional[str],
+                  log_path: Path, env: Optional[dict]) -> int:
     cmd = [
         sys.executable, str(SCRIPT_DIR / "Sort_Rips.py"),
         "--source", str(source),
@@ -359,21 +372,56 @@ def run_sort_rips(source: Path, dest: Path, processed: Path, no_audio: bool,
         "--processed", str(processed),
         "--summary-json", str(summary_json),
     ]
+    if whisper_model:
+        cmd += ["--whisper-model", whisper_model]
     if no_audio:
         cmd.append("--no-whisper-fallback")
-    run_subprocess(cmd)
+    return run_subprocess(cmd, log_path, env)
 
 
-def run_sort_tv(root: Path, dest: Path, no_audio: bool, summary_json: Path) -> None:
+def run_sort_tv(root: Path, dest: Path, no_audio: bool, summary_json: Path,
+                whisper_model: Optional[str], log_path: Path, env: Optional[dict]) -> int:
     cmd = [
         sys.executable, str(SCRIPT_DIR / "Sort_TV.py"),
         "--root", str(root),
         "--dest", str(dest),
         "--summary-json", str(summary_json),
     ]
+    if whisper_model:
+        cmd += ["--whisper-model", whisper_model]
     if no_audio:
         cmd.append("--no-audio-fallback")
-    run_subprocess(cmd)
+    return run_subprocess(cmd, log_path, env)
+
+
+# ---------------------------- per-pass workers ----------------------------
+
+def job_rips(idx: int, sampled: List[MovieGT], run_dir: Path, args, threads: int) -> dict:
+    src = run_dir / f"rips_idx{idx}"
+    out = run_dir / f"out_rips_idx{idx}"
+    proc = run_dir / f"proc_rips_idx{idx}"
+    summ = run_dir / f"rips_idx{idx}_summary.json"
+    log = run_dir / f"rips_idx{idx}.log"
+    rng = random.Random(args.seed + 100 + idx)
+    keymap, mode = stage_movies(sampled, src, idx, args.link_mode, rng)
+    rc = run_sort_rips(src, out, proc, args.no_audio_fallback, summ,
+                       args.whisper_model, log, child_env(threads))
+    return {"script": "rips", "idx": str(idx), "result": score_rips(keymap, out, [src, proc]),
+            "log": log, "mode": mode, "n": len(keymap), "rc": rc}
+
+
+def job_tv(idx: int, sampled: List[Season], run_dir: Path, args, eps_per_disc: int,
+           threads: int) -> dict:
+    src = run_dir / f"tv_idx{idx}"
+    out = run_dir / f"out_tv_idx{idx}"
+    summ = run_dir / f"tv_idx{idx}_summary.json"
+    log = run_dir / f"tv_idx{idx}.log"
+    rng = random.Random(args.seed + 200 + idx)
+    keymap, mode = stage_tv(sampled, src, idx, eps_per_disc, args.link_mode, rng)
+    rc = run_sort_tv(src, out, args.no_audio_fallback, summ,
+                     args.whisper_model, log, child_env(threads))
+    return {"script": "tv", "idx": str(idx), "result": score_tv(keymap, out, [src]),
+            "log": log, "mode": mode, "n": len(keymap), "rc": rc}
 
 
 # ---------------------------- scoring ----------------------------
@@ -639,6 +687,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--keep-staging", action="store_true")
     ap.add_argument("--no-audio-fallback", action="store_true",
                     help="Disable Whisper/audio fallback in the sorters (faster, less faithful).")
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="How many sorter passes to run concurrently (default: min(#passes, cores)). "
+                         "Each pass is capped to cores/jobs CPU threads.")
+    ap.add_argument("--whisper-model", default=None,
+                    help="Override the Whisper model the sorters use (e.g. tiny, base, small). "
+                         "Smaller = much faster CPU transcription, slightly lower ID accuracy.")
+    ap.add_argument("--fast", action="store_true",
+                    help="Speed preset for large sweeps: uses the 'base' Whisper model unless "
+                         "--whisper-model is given. Opt-in; off = production-faithful models.")
     return ap.parse_args()
 
 
@@ -662,49 +719,78 @@ def main() -> int:
     do_tv = args.only in ("tv", "both")
     limit = args.limit if (args.limit is not None and args.limit > 0) else None
 
+    if args.fast and not args.whisper_model:
+        args.whisper_model = "base"
+
     run_id = "run_" + _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = staging_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Staging: {run_dir}")
-    print(f"Media  : movies={movies_root}  shows={shows_root}")
-    print(f"Limit  : {'ALL' if limit is None else limit}   eps/disc: {eps_per_disc or 'whole-season'}   "
-          f"indexes: {sorted(want_indexes)}   link-mode: {args.link_mode}   audio: {'OFF' if args.no_audio_fallback else 'ON'}")
 
     results: dict = {"rips": {}, "tv": {}}
 
     try:
-        # -- Sort_Rips -------------------------------------------------
-        if do_rips:
-            movies = harvest_movies(movies_root)
-            sampled = sample_movies(movies, limit, rng)
-            print(f"\n[RIPS] {len(sampled)}/{len(movies)} movies sampled.")
-            for idx in sorted(i for i in want_indexes if i in (1, 2)):
-                src = run_dir / f"rips_idx{idx}"
-                out = run_dir / f"out_rips_idx{idx}"
-                proc = run_dir / f"proc_rips_idx{idx}"
-                summ = run_dir / f"rips_idx{idx}_summary.json"
-                keymap, mode = stage_movies(sampled, src, idx, args.link_mode, rng)
-                pattern = RIPS_PATTERNS.get(idx, "unknown pattern")
-                print(f"[RIPS] Index {idx} ({pattern}): staged {len(keymap)} movies ({mode}).")
-                run_sort_rips(src, out, proc, args.no_audio_fallback, summ)
-                results["rips"][str(idx)] = score_rips(keymap, out, [src, proc])
+        # -- harvest + sample once (shared across all index passes) ----
+        rips_indexes = sorted(i for i in want_indexes if i in (1, 2)) if do_rips else []
+        tv_indexes = sorted(i for i in want_indexes if i in (1, 2, 3)) if do_tv else []
 
-        # -- Sort_TV ---------------------------------------------------
-        if do_tv:
+        sampled_movies: List[MovieGT] = []
+        sampled_seasons: List[Season] = []
+        if rips_indexes:
+            movies = harvest_movies(movies_root)
+            sampled_movies = sample_movies(movies, limit, rng)
+            print(f"[RIPS] {len(sampled_movies)}/{len(movies)} movies sampled.")
+        if tv_indexes:
             seasons = harvest_shows(shows_root)
-            sampled = sample_seasons(seasons, limit, rng)
-            n_eps = sum(len(s.episodes) for s in sampled)
+            sampled_seasons = sample_seasons(seasons, limit, rng)
+            n_eps = sum(len(s.episodes) for s in sampled_seasons)
             n_all = sum(len(s.episodes) for s in seasons)
-            print(f"\n[TV] {n_eps}/{n_all} episodes across {len(sampled)} season(s) sampled.")
-            for idx in sorted(i for i in want_indexes if i in (1, 2, 3)):
-                src = run_dir / f"tv_idx{idx}"
-                out = run_dir / f"out_tv_idx{idx}"
-                summ = run_dir / f"tv_idx{idx}_summary.json"
-                keymap, mode = stage_tv(sampled, src, idx, eps_per_disc, args.link_mode, rng)
-                pattern = TV_PATTERNS.get(idx, "unknown pattern")
-                print(f"[TV] Index {idx} ({pattern}): staged {len(keymap)} episodes ({mode}).")
-                run_sort_tv(src, out, args.no_audio_fallback, summ)
-                results["tv"][str(idx)] = score_tv(keymap, out, [src])
+            print(f"[TV]   {n_eps}/{n_all} episodes across {len(sampled_seasons)} season(s) sampled.")
+
+        # -- plan the parallel passes ----------------------------------
+        cores = os.cpu_count() or 8
+        n_passes = len(rips_indexes) + len(tv_indexes)
+        # Default to ~2 CPU threads per concurrent pass: CPU Whisper scales poorly
+        # past a couple of threads, so more passes x fewer threads beats few passes
+        # x many threads. --jobs overrides.
+        default_jobs = max(1, min(n_passes, cores // 2)) if n_passes else 1
+        workers = max(1, min(args.jobs or default_jobs, n_passes)) if n_passes else 1
+        threads = max(1, cores // workers)
+        model = args.whisper_model or "sorter defaults"
+
+        print(f"Staging: {run_dir}")
+        print(f"Media  : movies={movies_root}  shows={shows_root}")
+        print(f"Limit  : {'ALL' if limit is None else limit}   eps/disc: {eps_per_disc or 'whole-season'}   "
+              f"link-mode: {args.link_mode}   audio: {'OFF' if args.no_audio_fallback else 'ON'}")
+        print(f"Run    : {n_passes} sorter pass(es), {workers} concurrent x {threads} CPU thread(s), "
+              f"whisper={model}")
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        futures = {}
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for idx in rips_indexes:
+                futures[ex.submit(job_rips, idx, sampled_movies, run_dir, args, threads)] = ("rips", idx)
+            for idx in tv_indexes:
+                futures[ex.submit(job_tv, idx, sampled_seasons, run_dir, args, eps_per_disc, threads)] = ("tv", idx)
+            print(f"\nLaunched {len(futures)} pass(es); logs print below as each finishes.\n")
+            for fut in as_completed(futures):
+                script, idx = futures[fut]
+                patterns = RIPS_PATTERNS if script == "rips" else TV_PATTERNS
+                header = f"{'Sort_Rips' if script == 'rips' else 'Sort_TV'} Index {idx} ({patterns.get(idx, '?')})"
+                try:
+                    jr = fut.result()
+                except Exception as e:
+                    print("#" * 64)
+                    print(f"# {header} - FAILED: {type(e).__name__}: {e}")
+                    print("#" * 64)
+                    continue
+                results[script][str(idx)] = jr["result"]
+                print("#" * 64)
+                print(f"# {header}  staged {jr['n']}  link={jr['mode']}  exit={jr['rc']}")
+                print("#" * 64)
+                try:
+                    print(jr["log"].read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    pass
 
         print_report(results)
 

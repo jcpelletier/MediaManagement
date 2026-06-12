@@ -195,6 +195,7 @@ python3 accuracy_test.py \
   [--limit N] \           # N movies AND N episodes; omit for ALL
   [--only rips|tv|both] [--indexes 1,2,3] \
   [--episodes-per-disc 4] [--no-audio-fallback] \
+  [--jobs J] [--fast] [--whisper-model base] \
   --summary-json /tmp/accuracy_test_summary.json
 ```
 
@@ -202,6 +203,16 @@ python3 accuracy_test.py \
 report-only — it prints a per-index accuracy table, writes the summary JSON, and always
 exits 0 (non-zero only on harness errors). It makes one LLM call + subtitle/audio
 extraction per file per index, so use `--limit` to bound cost when iterating.
+
+**Performance.** The dominant cost is CPU Whisper transcription — the Shows library is
+mostly subtitle-less `.mp4`, so every episode falls back to audio transcription, once per
+index. The harness runs the index passes **concurrently** (`--jobs`, default ≈ cores/2,
+each pass capped to a slice of CPU threads) so a full `--limit 100` sweep finishes in a
+few hours instead of overnight. For a quick signal, `--fast` (or `--whisper-model
+tiny`/`base`) swaps in a smaller Whisper model — much faster, slightly lower ID accuracy.
+The GTX 970 is too old for ctranslate2's GPU compute types, so Whisper stays on CPU. The
+test never creates subtitle sidecars; generating those for sub-less episodes is the
+production sorters' job, which would let future runs use the faster subtitle path.
 
 **Jenkins job (manual trigger)**
 
