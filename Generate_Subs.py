@@ -254,6 +254,12 @@ def main():
                         help="List what would be generated without transcribing.")
     args = parser.parse_args()
 
+    # Under Jenkins, stdout is a pipe (not a TTY), so CPython block-buffers it
+    # and progress lines don't reach the build console until the buffer fills or
+    # the process exits. Flush on every newline so a long batch shows live
+    # per-file progress.
+    sys.stdout.reconfigure(line_buffering=True)
+
     if args.limit < 0:
         print("ERROR: --limit must be >= 0.")
         sys.exit(2)
