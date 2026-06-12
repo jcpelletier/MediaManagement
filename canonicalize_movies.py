@@ -105,9 +105,15 @@ def apply_rename(folder, new_name):
         print(f"  COLLISION: {target} exists - skipping")
         return False
     old_stem = folder.name
+    new_has_year = bool(re.search(r"\(\d{4}\)\s*$", new_name))
     for f in list(folder.iterdir()):
         if f.is_file() and f.name.startswith(old_stem):
-            newfn = new_name + f.name[len(old_stem):]
+            rest = f.name[len(old_stem):]
+            # If the file already carried a "(YYYY)" that new_name also has,
+            # drop the duplicate so we don't produce "Title (2002) (2002).mp4".
+            if new_has_year:
+                rest = re.sub(r"^\s*\(\d{4}\)", "", rest)
+            newfn = new_name + rest
             f.rename(folder / newfn)
             print(f"  file: {f.name} -> {newfn}")
     folder.rename(target)
