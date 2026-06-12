@@ -94,7 +94,9 @@ def plan_for_folder(folder, key):
     detail = (f"tmdb='{canon_title}' ({canon_year}) sim={s:.2f}"
               f"{' superset' if superset else ''}{'' if year_ok else ' YEAR-MISMATCH'}")
 
-    if year_ok and (superset or s >= 0.85):
+    # superset alone is unsafe for short titles that prefix a different film
+    # (Beetlejuice -> Beetlejuice Beetlejuice); require decent similarity too.
+    if year_ok and (s >= 0.85 or (superset and s >= 0.70)):
         return ("auto", folder.name, new_name, detail)
     return ("review", folder.name, new_name, detail)
 
@@ -168,7 +170,9 @@ def plan_flat(video, key):
         return ("review", video, new_folder, detail + " no-year")
     if (video.parent / new_folder).exists():
         return ("review", video, new_folder, detail + " TARGET-FOLDER-EXISTS")
-    if year_ok and (superset or s >= 0.85):
+    # superset alone is unsafe for short titles that prefix a different film
+    # (Beetlejuice -> Beetlejuice Beetlejuice); require decent similarity too.
+    if year_ok and (s >= 0.85 or (superset and s >= 0.70)):
         return ("auto", video, new_folder, detail)
     return ("review", video, new_folder, detail)
 
