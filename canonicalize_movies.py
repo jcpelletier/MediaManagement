@@ -96,7 +96,11 @@ def plan_for_folder(folder, key):
 
     # superset alone is unsafe for short titles that prefix a different film
     # (Beetlejuice -> Beetlejuice Beetlejuice); require decent similarity too.
-    if year_ok and (s >= 0.85 or (superset and s >= 0.70)):
+    # TMDB sometimes ranks a 'Lego <title>' parody short above the real film
+    # when the source name differs from TMDB's canonical (Raiders of the Lost
+    # Ark). Route a newly-added 'Lego' prefix to REVIEW.
+    lego_added = squash(canon_title).startswith('lego') and not squash(cur_title).startswith('lego')
+    if year_ok and not lego_added and (s >= 0.85 or (superset and s >= 0.70)):
         return ("auto", folder.name, new_name, detail)
     return ("review", folder.name, new_name, detail)
 
@@ -172,7 +176,11 @@ def plan_flat(video, key):
         return ("review", video, new_folder, detail + " TARGET-FOLDER-EXISTS")
     # superset alone is unsafe for short titles that prefix a different film
     # (Beetlejuice -> Beetlejuice Beetlejuice); require decent similarity too.
-    if year_ok and (s >= 0.85 or (superset and s >= 0.70)):
+    # TMDB sometimes ranks a 'Lego <title>' parody short above the real film
+    # when the source name differs from TMDB's canonical (Raiders of the Lost
+    # Ark). Route a newly-added 'Lego' prefix to REVIEW.
+    lego_added = squash(canon_title).startswith('lego') and not squash(cur_title).startswith('lego')
+    if year_ok and not lego_added and (s >= 0.85 or (superset and s >= 0.70)):
         return ("auto", video, new_folder, detail)
     return ("review", video, new_folder, detail)
 
