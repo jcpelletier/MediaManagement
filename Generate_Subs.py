@@ -200,6 +200,13 @@ def generate_subs_for_video(
                 task="translate" if translate else "transcribe",
                 beam_size=beam_size,
                 vad_filter=use_vad,
+                # Word-level DTW alignment so each cue's start/end snap to when
+                # the words are actually spoken. Without this, Whisper emits
+                # coarse segment timestamps anchored to its ~30s decode windows,
+                # producing long "blanket" cues that can begin 2-3s before the
+                # dialogue (observed on Voyager S01E05 ~20:00). Costs ~14% extra
+                # CPU time — cheap enough to keep on for every run.
+                word_timestamps=True,
             )
             # segments is a generator; write_srt consumes it (transcription
             # actually runs here, lazily, as blocks are pulled).
