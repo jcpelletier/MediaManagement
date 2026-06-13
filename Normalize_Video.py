@@ -29,9 +29,12 @@ the audio timeline is unchanged, so any existing `Name.en.srt` sidecar stays
 valid — no subtitle regeneration needed. The leftover data/timecode track is
 dropped.
 
-Healthy files (nominal ≈ actual frame rate) are skipped, so this is safe to
-point at the whole library as a sweep and safe to re-run: a repaired file is now
-CFR and won't be flagged again.
+Detection is two-stage so a sweep doesn't needlessly re-encode healthy files:
+a cheap nominal-vs-actual frame-rate check flags candidates, then a frame-
+interval irregularity check confirms the file is genuinely variable/irregular
+before repairing it. This matters because some containers are merely *mislabeled*
+(true 23.976fps content tagged 29.97fps) — evenly spaced, plays fine, left alone.
+Repaired files are CFR and won't be re-flagged, so the sweep is idempotent.
 
 Video: H.264 (NVENC, CQ 19, preset p4) by default; --encoder libx264 for CPU.
 Audio: copied as-is.   MP4: +faststart.
@@ -49,10 +52,23 @@ from typing import List, Optional, Tuple
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".mpg", ".mpeg", ".ts", ".wmv"}
 
-# A file is "damaged" if this fraction or more of the frames the nominal rate
-# implies are actually missing (actual avg rate has fallen that far below
-# nominal). 0.03 → flag when >3% of frames are gone. E05 was ~17%.
+# Stage 1 (cheap): a file is a damage *candidate* if this fraction or more of
+# the frames the nominal rate implies are missing (actual avg rate has fallen
+# that far below nominal). 0.03 → flag when >3% are gone. E05 was ~17%.
 DEFAULT_MISSING_THRESHOLD = 0.03
+
+# Stage 2 (confirm): a rate mismatch alone is ambiguous — a file can be true
+# 23.976fps content sitting in a container mislabeled 29.97fps, which is evenly
+# spaced and plays fine. We only treat a candidate as genuinely damaged if its
+# frame intervals are actually irregular (VFR). Fraction of frame-to-frame
+# intervals that deviate >40% from the median; genuine VFR rips measure ~0.20+,
+# clean CFR measures ~0.00.
+DEFAULT_IRREGULARITY_THRESHOLD = 0.05
+
+# Stage 2 only reads this many seconds of frame timestamps (these rips are
+# uniformly damaged, so a few minutes is representative and keeps a library
+# sweep fast). 0 = whole file.
+DEFAULT_SAMPLE_SECONDS = 300
 
 
 def run_cmd(cmd: list) -> Tuple[int, str, str]:
@@ -156,9 +172,44 @@ def assess(info: dict, threshold: float) -> Tuple[bool, float, str]:
     if missing < threshold:
         return False, missing, (f"ok ({basis}: {actual:.0f}/{expected:.0f} frames, "
                                 f"{missing*100:.1f}% missing)")
-    return True, missing, (f"DAMAGED ({basis}: {actual:.0f}/{expected:.0f} frames, "
-                           f"{missing*100:.1f}% missing; nominal {r_rate:.3f}fps "
-                           f"vs actual {actual/duration:.3f}fps)")
+    return True, missing, (f"rate-flagged ({basis}: {actual:.0f}/{expected:.0f} frames, "
+                           f"{missing*100:.1f}% below nominal {r_rate:.3f}fps "
+                           f"-> actual {actual/duration:.3f}fps)")
+
+
+def measure_irregularity(video_path: Path, sample_seconds: int) -> Optional[float]:
+    """
+    Fraction of frame-to-frame intervals that deviate >40% from the median
+    interval, over the first `sample_seconds` of video (0 = whole file).
+
+    ~0.0 means evenly-spaced CFR (a rate mismatch here is just a mislabeled
+    container, NOT damage); ~0.2+ means genuinely irregular/VFR. Returns None
+    if it can't be measured.
+    """
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0"]
+    if sample_seconds and sample_seconds > 0:
+        cmd += ["-read_intervals", f"%+{sample_seconds}"]
+    cmd += ["-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0", str(video_path)]
+    rc, out, _ = run_cmd(cmd)
+    if rc != 0:
+        return None
+    ts = []
+    for line in out.splitlines():
+        line = line.strip().rstrip(",")
+        if not line:
+            continue
+        try:
+            ts.append(float(line))
+        except ValueError:
+            continue
+    if len(ts) < 100:
+        return None
+    ts.sort()
+    deltas = [ts[i] - ts[i - 1] for i in range(1, len(ts))]
+    med = sorted(deltas)[len(deltas) // 2]
+    if med <= 0:
+        return None
+    return sum(1 for x in deltas if abs(x - med) > 0.40 * med) / len(deltas)
 
 
 def normalize_file(video_path: Path, target_rate: str, encoder: str,
@@ -238,8 +289,15 @@ def main():
     parser.add_argument("--encoder", default="nvenc", choices=["nvenc", "libx264"],
                         help="Video encoder for the repair (default: nvenc).")
     parser.add_argument("--threshold", type=float, default=DEFAULT_MISSING_THRESHOLD,
-                        help=f"Flag a file when this fraction of frames are missing "
-                             f"(default: {DEFAULT_MISSING_THRESHOLD} = 3%%).")
+                        help=f"Stage 1: flag a candidate when this fraction of frames are "
+                             f"below the nominal rate (default: {DEFAULT_MISSING_THRESHOLD} = 3%%).")
+    parser.add_argument("--irregularity-threshold", type=float, default=DEFAULT_IRREGULARITY_THRESHOLD,
+                        help=f"Stage 2: only repair a candidate if this fraction of its frame "
+                             f"intervals are irregular (default: {DEFAULT_IRREGULARITY_THRESHOLD}). "
+                             f"Guards against re-encoding mislabeled-but-CFR files.")
+    parser.add_argument("--sample-seconds", type=int, default=DEFAULT_SAMPLE_SECONDS,
+                        help=f"Seconds of frame timestamps to read for the stage-2 check "
+                             f"(default: {DEFAULT_SAMPLE_SECONDS}; 0 = whole file).")
     parser.add_argument("--keep-backup", action="store_true",
                         help="Keep the original alongside the repair as <name>.<ext>.orig.")
     parser.add_argument("--force", action="store_true",
@@ -294,6 +352,20 @@ def main():
 
         damaged, missing, reason = assess(info, args.threshold)
         print(f"  {reason}")
+
+        # Stage 2: confirm a rate-flagged candidate is genuinely irregular (VFR)
+        # before repairing it. An evenly-spaced file flagged only because its
+        # nominal rate is mislabeled plays fine and must NOT be re-encoded.
+        if damaged and not args.force:
+            irr = measure_irregularity(video, args.sample_seconds)
+            if irr is None:
+                print("  (could not measure frame spacing; trusting rate check.)")
+            elif irr < args.irregularity_threshold:
+                print(f"  ...but frames are evenly spaced ({irr*100:.1f}% irregular) "
+                      f"-- mislabeled CFR, not damaged; skipping.")
+                damaged = False
+            else:
+                print(f"  confirmed VFR ({irr*100:.1f}% irregular intervals).")
 
         if not damaged and not args.force:
             counts["skipped"] += 1
