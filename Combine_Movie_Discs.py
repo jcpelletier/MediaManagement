@@ -24,9 +24,14 @@ Two output modes:
             this is checked via ffprobe and refused on mismatch unless --force.
 
 Disc folders are passed in playback order (disc 1 first). Each --disc may be a
-folder (the largest video file in it is taken as that half's feature) or a
-direct path to a video file. An optional --extras folder's video files are
-moved into the movie's Extras/ subfolder.
+folder (the longest-runtime title in it is taken as that half's feature — see
+--prefer) or a direct path to a video file. An optional --extras folder's video
+files are moved into the movie's Extras/ subfolder.
+
+Feature selection for a folder defaults to longest runtime rather than largest
+byte size: on discs that expose multiple cuts via seamless branching (theatrical
+/ special / extended), the halves are near-identical in size but differ in
+duration, and "longest" reliably lands on the most complete cut.
 
 Requires:
 - ffmpeg / ffprobe on PATH
@@ -70,9 +75,28 @@ def collect_video_files(folder: Path, extensions: List[str]) -> List[Path]:
     return [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in extensions]
 
 
-def resolve_disc_feature(disc: Path, extensions: List[str]) -> Optional[Path]:
-    """A --disc arg is either a video file (used as-is) or a folder (take its
-    largest video file as that disc's feature half)."""
+def ffprobe_duration_seconds(video: Path) -> Optional[float]:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nw=1:nk=1",
+        str(video),
+    ]
+    rc, out, _ = run_cmd(cmd)
+    if rc != 0:
+        return None
+    try:
+        return float(out.strip())
+    except ValueError:
+        return None
+
+
+def resolve_disc_feature(disc: Path, extensions: List[str], prefer: str = "longest") -> Optional[Path]:
+    """A --disc arg is either a video file (used as-is) or a folder. For a
+    folder, pick the feature half by longest runtime (default) — duration is a
+    more reliable signal than byte size on seamless-branching discs that expose
+    multiple cuts at near-identical sizes. Falls back to largest byte size when
+    no durations are readable, or when prefer='largest'."""
     if disc.is_file():
         if disc.suffix.lower() not in extensions:
             print(f"  WARN: {disc.name} is not a recognized video extension; using it anyway")
@@ -82,7 +106,15 @@ def resolve_disc_feature(disc: Path, extensions: List[str]) -> Optional[Path]:
         if not vids:
             print(f"  ERROR: no video files in disc folder {disc}")
             return None
-        return max(vids, key=lambda p: p.stat().st_size)
+        if prefer == "largest":
+            return max(vids, key=lambda p: p.stat().st_size)
+        # prefer == "longest": choose by runtime, fall back to byte size
+        timed = [(v, ffprobe_duration_seconds(v)) for v in vids]
+        timed = [(v, d) for v, d in timed if d is not None and d > 0]
+        if not timed:
+            print(f"  WARN: no readable durations in {disc.name}; falling back to largest file size")
+            return max(vids, key=lambda p: p.stat().st_size)
+        return max(timed, key=lambda vd: vd[1])[0]
     print(f"  ERROR: disc path does not exist: {disc}")
     return None
 
@@ -353,12 +385,14 @@ def combine(args: argparse.Namespace, extensions: List[str]) -> Result:
     # Resolve each disc to its feature file, preserving the caller's order.
     feature_files: List[Path] = []
     for disc in args.disc:
-        feat = resolve_disc_feature(disc, extensions)
+        feat = resolve_disc_feature(disc, extensions, args.prefer)
         if feat is None:
             return Result(title=title, year=year, mode=args.mode, dry_run=args.dry_run,
                           error=f"could not resolve a feature file for disc: {disc}")
         size_gb = feat.stat().st_size / (1024 ** 3)
-        print(f"  disc {len(feature_files) + 1}: {feat}  ({size_gb:.2f} GB)")
+        dur = ffprobe_duration_seconds(feat)
+        dur_str = f"{dur / 60:.1f} min" if dur else "unknown runtime"
+        print(f"  disc {len(feature_files) + 1}: {feat}  ({size_gb:.2f} GB, {dur_str})")
         feature_files.append(feat)
 
     print(f"\nMovie    : {base_name}")
@@ -404,6 +438,10 @@ def parse_args() -> argparse.Namespace:
                         "Repeat for each half (--disc D1 --disc D2 ...).")
     p.add_argument("--extras", type=Path, default=None,
                    help="Optional bonus-features disc folder; its videos go to Extras/.")
+    p.add_argument("--prefer", choices=["longest", "largest"], default="longest",
+                   help="When a --disc is a folder, pick the feature half by longest "
+                        "runtime (default) or largest byte size. Ignored when --disc "
+                        "is a direct file path.")
     p.add_argument("--dest", type=Path, default=DEFAULT_DEST,
                    help=f"Movie library root (default: {DEFAULT_DEST})")
     p.add_argument("--processed", type=Path, default=DEFAULT_PROCESSED,

@@ -125,8 +125,12 @@ Movies/
 
 **Behavior notes**
 
-- Each `--disc` is a folder (its largest video file is taken as that half's feature)
-  or a direct path to a video file. Discs are passed **in playback order**.
+- Each `--disc` is a folder or a direct path to a video file, passed **in playback
+  order**. For a folder, the feature half is chosen by **longest runtime** by default
+  (`--prefer largest` to use byte size instead). Duration beats size on
+  seamless-branching discs, where the theatrical/special/extended cuts are
+  near-identical in size but differ in length — "longest" lands on the most complete
+  cut. Point `--disc` at a specific file to override selection entirely.
 - Title/year are canonicalized against TMDB when `TMDB_API_KEY` is set, but this is
   non-fatal — a failed/absent lookup falls back to the supplied values and never
   blocks. Use `--no-verify` to skip it.
