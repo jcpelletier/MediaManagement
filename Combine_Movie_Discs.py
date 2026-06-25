@@ -15,13 +15,16 @@ film. A heuristic can't tell these apart reliably, so the caller asserts the
 disc order on the command line and this script trusts it.
 
 Two output modes:
-  - stack  (default): Jellyfin/Plex multi-part stacking. Each half is moved
-            into the movie folder as "Title (Year) - partN.ext". No re-encode,
-            no concat risk, and the players stitch them into one continuous
-            playback. Codecs of the halves don't even have to match.
-  - concat (--concat): stream-copy the halves into a single "Title (Year).ext".
-            Only safe when the halves share codec/resolution/pixel-format/audio;
-            this is checked via ffprobe and refused on mismatch unless --force.
+  - concat (default): stream-copy the halves into a single "Title (Year).ext"
+            (all streams preserved via -map 0). Plays as one file everywhere;
+            Jellyfin multi-part playback is unreliable. Only safe when the halves
+            share codec/resolution/pixel-format/audio (always true for rips from
+            the same disc set); checked via ffprobe and refused on mismatch unless
+            --force. Non-destructive: the source halves are left intact and the
+            disc folders move to Processed.
+  - stack (--stack): Jellyfin/Plex multi-part stacking — each half is MOVED into
+            the movie folder as "Title (Year) - partN.ext". No re-encode and the
+            codecs needn't match, but multi-part playback support varies by client.
 
 Disc folders are passed in playback order (disc 1 first). Each --disc may be a
 folder (the longest-runtime title in it is taken as that half's feature — see
@@ -268,7 +271,7 @@ def do_concat(feature_files: List[Path], movie_dir: Path, base_name: str,
         msg = f"concat incompatible: {detail}"
         if not force:
             print(f"  ERROR: {msg}")
-            print("         Halves don't share a format — re-encode first, or use stacking (drop --concat).")
+            print("         Halves don't share a format — re-encode first, or use --stack.")
             return [], msg
         print(f"  WARN: {msg} — proceeding anyway because --force was given")
     else:
@@ -449,11 +452,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--processed", type=Path, default=DEFAULT_PROCESSED,
                    help=f"Where source disc folders are moved after combining "
                         f"(default: {DEFAULT_PROCESSED})")
-    p.add_argument("--concat", dest="mode", action="store_const", const="concat", default="stack",
-                   help="Stream-copy the halves into one file instead of multi-part stacking. "
-                        "Requires matching codecs/resolution across halves.")
+    p.add_argument("--stack", dest="mode", action="store_const", const="stack",
+                   help="Multi-part stack the halves (Title - part1/part2) instead of "
+                        "concatenating. Note: Jellyfin multi-part playback is unreliable, and "
+                        "stacking MOVES the source halves out of the disc folders.")
+    p.add_argument("--concat", dest="mode", action="store_const", const="concat",
+                   help="(default) Stream-copy the halves into one file. Requires matching "
+                        "codecs/resolution across halves.")
+    p.set_defaults(mode="concat")
     p.add_argument("--force", action="store_true",
-                   help="With --concat, proceed even if the halves' formats don't match (risky).")
+                   help="With concat, proceed even if the halves' formats don't match (risky).")
     p.add_argument("--overwrite", action="store_true",
                    help="Replace existing destination files.")
     p.add_argument("--keep-source", action="store_true",

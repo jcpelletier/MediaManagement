@@ -103,22 +103,23 @@ Run it over SSH on panda (`wsl ssh genesis@192.168.1.100 "..."`). The library
 
 **Modes**
 
-- **stack** (default): Jellyfin/Plex multi-part stacking. Each half is *moved* into
-  the movie folder as `Title (Year) - part1.ext`, `… - part2.ext`. No re-encode, no
-  concat risk, and the halves' codecs don't even have to match — the players stitch
-  them into one continuous playback.
-- **concat** (`--concat`): stream-copy the halves into a single `Title (Year).ext`.
-  ffprobe-checks codec/resolution/pixel-format/audio across halves first and refuses
-  on mismatch (override with `--force`). Use only when the halves came from the same
-  disc set.
+- **concat** (default): stream-copy the halves into a single `Title (Year).ext`, with
+  `-map 0` so every audio/subtitle track is preserved. ffprobe-checks
+  codec/resolution/pixel-format/audio across halves first and refuses on mismatch
+  (override with `--force`). Plays as one file everywhere — Jellyfin's multi-part
+  playback is unreliable, so this is the default. **Non-destructive**: the source
+  halves are left intact in the disc folders, which then move to `Processed`.
+- **stack** (`--stack`): Jellyfin/Plex multi-part stacking — each half is *moved* into
+  the movie folder as `Title (Year) - part1.ext`, `… - part2.ext`. No re-encode and
+  codecs needn't match, but multi-part playback support varies by client/server, and
+  this consumes the source halves (they're moved, not copied).
 
-**Output structure** (stacking)
+**Output structure** (concat, default)
 
 ```
 Movies/
   Avatar (2009)/
-    Avatar (2009) - part1.mkv   ← largest video file from disc 1
-    Avatar (2009) - part2.mkv   ← largest video file from disc 2
+    Avatar (2009).mkv           ← longest cut from disc 1 + disc 2, joined
     Extras/
       <bonus features from the --extras disc>
 ```
