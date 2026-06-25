@@ -298,8 +298,10 @@ def do_concat(feature_files: List[Path], movie_dir: Path, base_name: str,
             esc = str(f.resolve()).replace("'", "'\\''")
             lf.write(f"file '{esc}'\n")
     try:
+        # -map 0 keeps ALL streams (every audio track, subtitles); without it
+        # ffmpeg's default selection keeps only one audio track per output.
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-               "-i", str(list_path), "-c", "copy", str(dest)]
+               "-i", str(list_path), "-map", "0", "-c", "copy", str(dest)]
         rc, _, err = run_cmd(cmd)
     finally:
         try:
