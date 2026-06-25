@@ -74,6 +74,68 @@ Movies/
 - TV show folders are correctly skipped — a TV-disc heuristic (folder name markers like `Season`/`SxxExx`, or several similarly-sized titles with episode-length median runtime) defers them to `Sort_TV.py` without sending them through TMDB's movie index. Disney/Pixar discs that expose the same feature as multiple large playlists are disambiguated by median duration (≥75 min → movie).
 - After processing, non-video leftovers (subtitles, nfo files, etc.) are moved to `--processed`. If all files were moved to the library the source folder is deleted.
 
+### Combine_Movie_Discs.py
+
+Combines a movie that was ripped across multiple discs into one Jellyfin library
+entry. **Human-triggered, not part of the automatic pipeline** — you (or Pandabot
+acting for you) look at the staging folders, decide which discs are the halves of
+the feature and which is a bonus disc, and name the movie. The script does the
+mechanical work.
+
+Why it isn't automatic: two sibling folders that both fuzzy-match one title could
+be two halves to join, a feature + an extras disc, or a duplicate rip — and the
+order of the halves matters (joining them backwards corrupts the film). The caller
+asserts the disc order; the script trusts it.
+
+**Pandabot phrasing → invocation.** "These are part 1 and 2 of Avatar (2009),
+combine them and put them in the Jellyfin library" maps to:
+
+```bash
+python Combine_Movie_Discs.py \
+  --title "Avatar" --year 2009 \
+  --disc /mnt/media/Video/AVATAR_DISC_1 \
+  --disc /mnt/media/Video/AVATAR_DISC_2 \
+  [--extras /mnt/media/Video/AVATAR_DISC_3]
+```
+
+Run it over SSH on panda (`wsl ssh genesis@192.168.1.100 "..."`). The library
+(`--dest`) defaults to `/mnt/media/Media/Movies` — the Jellyfin source.
+
+**Modes**
+
+- **stack** (default): Jellyfin/Plex multi-part stacking. Each half is *moved* into
+  the movie folder as `Title (Year) - part1.ext`, `… - part2.ext`. No re-encode, no
+  concat risk, and the halves' codecs don't even have to match — the players stitch
+  them into one continuous playback.
+- **concat** (`--concat`): stream-copy the halves into a single `Title (Year).ext`.
+  ffprobe-checks codec/resolution/pixel-format/audio across halves first and refuses
+  on mismatch (override with `--force`). Use only when the halves came from the same
+  disc set.
+
+**Output structure** (stacking)
+
+```
+Movies/
+  Avatar (2009)/
+    Avatar (2009) - part1.mkv   ← largest video file from disc 1
+    Avatar (2009) - part2.mkv   ← largest video file from disc 2
+    Extras/
+      <bonus features from the --extras disc>
+```
+
+**Behavior notes**
+
+- Each `--disc` is a folder (its largest video file is taken as that half's feature)
+  or a direct path to a video file. Discs are passed **in playback order**.
+- Title/year are canonicalized against TMDB when `TMDB_API_KEY` is set, but this is
+  non-fatal — a failed/absent lookup falls back to the supplied values and never
+  blocks. Use `--no-verify` to skip it.
+- After combining, the source disc folders (including the extras disc) are moved to
+  `--processed` (default `/mnt/media/Video/Processed`) so the automatic
+  `Process_Movies` run won't re-grab the halves. `--keep-source` leaves them in place.
+- `--dry-run` prints the plan without touching anything; `--summary-json` writes a
+  result summary for notifications.
+
 ### Sort_TV.py
 
 Identifies and renames TV episode `.mkv` files in place. Parses show/season from the parent folder name (e.g. `DS9S1D2`), extracts subtitle or audio evidence, asks DeepSeek to identify the episode, then verifies against TMDB.
