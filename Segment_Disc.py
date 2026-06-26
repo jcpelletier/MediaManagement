@@ -156,7 +156,11 @@ def segment_one(src: Path, out_dir: Path, episode_minutes: float,
     if len(segments) < 2:
         return False
     print(f"{src.name}: {duration/60:.1f} min, {len(chapters)} chapters -> {len(segments)} segments")
-    written = split_file(src, segments, out_dir, src.stem, dry_run=dry_run)
+    # Prefix with the disc folder name so segments are globally unique: different
+    # discs both rip to "A1_t00.mkv", and downstream per-file tracking keys on
+    # the filename, so identical basenames across folders would collide.
+    prefix = f"{src.parent.name} {src.stem}"
+    written = split_file(src, segments, out_dir, prefix, dry_run=dry_run)
     complete = len(written) == len(segments) and all(p.exists() for p in written)
     if replace and not dry_run and complete:
         src.unlink()

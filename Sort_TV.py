@@ -1582,6 +1582,7 @@ def rename_and_move(
     def _log_rename() -> None:
         _RENAME_LOG.append({
             "src": src.name,
+            "folder": src.parent.name,
             "decision": "renamed",
             "show": show,
             "season": season,
@@ -3310,26 +3311,32 @@ def main(argv=None):
         # unaccounted skip so the map is complete. All sources populate in
         # dry-run too.
         results = []
-        _seen_src = set()
+        _seen = set()
 
-        def _add_result(rec: dict) -> None:
-            src_name = rec.get("src")
-            if not src_name or src_name in _seen_src:
+        def _add_result(folder: Optional[str], src_name: Optional[str], rec: dict) -> None:
+            # Key on (folder, filename): different discs rip to identically named
+            # titles, so a filename alone is not unique across folders.
+            if not src_name:
                 return
-            _seen_src.add(src_name)
+            key = (folder, src_name)
+            if key in _seen:
+                return
+            _seen.add(key)
             results.append(rec)
 
         for rec in _RENAME_LOG:
-            _add_result(rec)
+            _add_result(rec.get("folder"), rec.get("src"), rec)
         for mkv_path, show_name, season_num in extras_queue:
-            _add_result({"src": mkv_path.name, "decision": "extra",
-                         "show": show_name, "season": season_num})
+            _add_result(mkv_path.parent.name, mkv_path.name,
+                        {"src": mkv_path.name, "folder": mkv_path.parent.name,
+                         "decision": "extra", "show": show_name, "season": season_num})
         for sk in skipped_files:
-            _add_result({"src": sk.get("file"), "decision": "skipped",
-                         "reason": sk.get("reason")})
+            _add_result(None, sk.get("file"),
+                        {"src": sk.get("file"), "decision": "skipped", "reason": sk.get("reason")})
         for p in mkvs:
-            _add_result({"src": p.name, "decision": "skipped",
-                         "reason": "not identified"})
+            _add_result(p.parent.name, p.name,
+                        {"src": p.name, "folder": p.parent.name,
+                         "decision": "skipped", "reason": "not identified"})
 
         summary = {
             "total": total,
