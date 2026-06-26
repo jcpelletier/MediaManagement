@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "disc_title": "Aladdin (1992)",
+  "ripped_at": "2026-06-26",
+  "source": "backfill",
+  "notes": "Real movie disc: one 90-min feature plus four 6-14 min extras. Tests the feature-length gate: several substantial short titles must NOT route a genuine movie to TV. Sizes/durations recovered via ffprobe from the sorted library folder; the feature's raw output filename was lost in the rename.",
+  "verified": true,
+  "expected_routing": "movie",
+  "titles": [
+    {
+      "src": null,
+      "size_bytes": 1565532540,
+      "duration_s": 5424,
+      "expected": {
+        "type": "movie",
+        "title": "Aladdin",
+        "year": 1992
+      }
+    },
+    {
+      "src": "P6_t01.mp4",
+      "size_bytes": 409080973,
+      "duration_s": 845,
+      "expected": { "type": "extra" }
+    },
+    {
+      "src": "Q4_t04.mp4",
+      "size_bytes": 148175044,
+      "duration_s": 347,
+      "expected": { "type": "extra" }
+    },
+    {
+      "src": "T6_t03.mp4",
+      "size_bytes": 236377332,
+      "duration_s": 694,
+      "expected": { "type": "extra" }
+    },
+    {
+      "src": "V1_t00.mp4",
+      "size_bytes": 246805515,
+      "duration_s": 696,
+      "expected": { "type": "extra" }
+    }
+  ]
+}

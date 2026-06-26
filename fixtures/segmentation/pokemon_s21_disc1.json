@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "disc_title": "Pokemon Season 21 Disc 1",
+  "source_file": "A1_t00.mkv",
+  "notes": "Concatenated 'Play All' rip: one 170.4-min title for the whole disc, 33 chapters, bitmap (dvd_subtitle) subs. All five S21 discs share this exact structure: 8 episodes of ~21.3 min, each beginning on a chapter boundary (a recurring ~0.5-min preview chapter delimits episodes). Chapters captured via ffprobe -show_chapters (start_s, end_s).",
+  "verified": true,
+  "chapters": [
+    [0.0, 154.538], [154.538, 683.516], [683.516, 1246.495], [1246.495, 1277.109],
+    [1277.109, 1481.613], [1481.613, 1878.593], [1878.593, 2523.571], [2523.571, 2554.185],
+    [2554.185, 2754.685], [2754.685, 3285.666], [3285.666, 3800.647], [3800.647, 3831.261],
+    [3831.261, 3953.8], [3953.8, 4536.849], [4536.849, 5077.839], [5077.839, 5108.437],
+    [5108.437, 5183.011], [5183.011, 5619.998], [5619.998, 6354.932], [6354.932, 6385.546],
+    [6385.546, 6461.121], [6461.121, 6894.104], [6894.104, 7632.041], [7632.041, 7662.655],
+    [7662.655, 7862.154], [7862.154, 8273.148], [8273.148, 8909.117], [8909.117, 8939.731],
+    [8939.731, 9147.238], [9147.238, 9645.236], [9645.236, 10186.226], [10186.226, 10216.84],
+    [10216.84, 10222.813]
+  ],
+  "expected_episodes": 8,
+  "expected_episode_minutes": 21.3,
+  "expected_boundaries_s": [
+    0.0, 1277.109, 2554.185, 3831.261, 5108.437, 6385.546, 7662.655, 8939.731, 10222.813
+  ]
+}

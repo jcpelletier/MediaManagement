@@ -1,0 +1,5 @@
+# Test deps for the sort-accuracy suite.
+# Tier 1 (test_routing.py) needs only these to import the sort scripts.
+pytest
+requests
+pydantic

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "disc_title": "PAW PATROL_ PUPS SAVE PUPLANTIS#9B2B",
+  "ripped_at": "2026-06-25",
+  "source": "backfill",
+  "notes": "Water-themed Paw Patrol compilation: a double-length special plus single-length episodes from a couple of seasons. Originally misrouted as a movie ('Pups Save Puplantis (2019)') with the four episodes dumped into Extras/, because the size-similarity routing test rejected the 12-min episodes (0.52x the 23-min special). Routing ground truth is verified (TV disc); per-episode identity not yet labeled. Sizes/durations recovered via ffprobe; the special's raw output filename was lost in the rename (it is now the .mkv at the movie folder root). makemkv reported 7 titles; titles 5 and 6 failed to save during the rip.",
+  "verified": true,
+  "expected_routing": "tv",
+  "titles": [
+    {
+      "src": null,
+      "size_bytes": 992609474,
+      "duration_s": 1404,
+      "expected": null
+    },
+    {
+      "src": "B2_t01.mkv",
+      "size_bytes": 521223393,
+      "duration_s": 738,
+      "expected": null
+    },
+    {
+      "src": "B3_t02.mkv",
+      "size_bytes": 521459782,
+      "duration_s": 738,
+      "expected": null
+    },
+    {
+      "src": "C1_t03.mkv",
+      "size_bytes": 527997562,
+      "duration_s": 738,
+      "expected": null
+    },
+    {
+      "src": "C2_t04.mkv",
+      "size_bytes": 531667034,
+      "duration_s": 738,
+      "expected": null
+    }
+  ]
+}

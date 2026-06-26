@@ -512,23 +512,13 @@ def extract_subtitle_windows(
         return windows if windows else None
 
 
-def extract_subtitle_full(
-    mkv_path: Path,
-    max_chars: int = 60000,
-    skip_head_seconds: float = 300.0,
-) -> Optional[str]:
-    """Pull the full post-intro subtitle dialogue as a single block of text.
+def _srt_text_from_mkv(mkv_path: Path) -> Optional[str]:
+    """Extract the best text-subtitle stream from an MKV as raw SRT text.
 
-    Used by the season-match identifier (bug 152 rewrite): instead of three
-    short windows + concat + 4K-char cap, the LLM sees enough plot beats from
-    the whole episode to disambiguate against the full TMDB synopsis list
-    in a single constrained-choice call. A 22-minute AD episode produces
-    ~10-15K chars of post-intro dialogue, well inside the 60K safety cap
-    and well inside DeepSeek-V3's context window.
-
-    Returns None when subtitles are unavailable / bitmap-only / parse-fails.
-    Returns the dialogue text on success; falls back to all cues when the
-    whole file fits inside the intro-skip window."""
+    The slow / media-dependent half of subtitle evidence (runs ffmpeg). Split
+    out from parsing so the sort-accuracy tests can cache this raw SRT once and
+    replay the deterministic parsing offline. Returns None when subtitles are
+    unavailable, bitmap-only, or extraction fails."""
     streams = ffprobe_subtitle_streams(mkv_path)
     if streams and subtitles_are_bitmap_only(streams):
         return None
@@ -550,68 +540,101 @@ def extract_subtitle_full(
             return None
 
         try:
-            txt = srt_path.read_text(encoding="utf-8", errors="ignore")
+            return srt_path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
-            txt = srt_path.read_text(encoding="latin-1", errors="ignore")
+            return srt_path.read_text(encoding="latin-1", errors="ignore")
 
-        cues: List[Tuple[float, str]] = []
-        current_start: Optional[float] = None
-        current_buf: List[str] = []
 
-        def _flush():
-            if current_start is not None and current_buf:
-                text = " ".join(current_buf).strip()
-                if text:
-                    cues.append((current_start, text))
+def parse_full_dialogue(
+    srt_text: str,
+    max_chars: int = 60000,
+    skip_head_seconds: float = 300.0,
+) -> Optional[str]:
+    """Parse raw SRT text into the full post-intro dialogue block.
 
-        for raw_line in txt.splitlines():
-            line = raw_line.strip()
-            if not line:
-                _flush()
-                current_start = None
-                current_buf = []
-                continue
-            if re.fullmatch(r"\d+", line):
-                continue
-            ts = _SRT_TS_RE.match(line)
-            if ts:
-                _flush()
-                current_start = _srt_ts_to_seconds(ts.group(1), ts.group(2), ts.group(3), ts.group(4))
-                current_buf = []
-                continue
-            line = re.sub(r"</?i>", "", line)
-            line = re.sub(r"</?b>", "", line)
-            line = re.sub(r"</?u>", "", line)
-            line = re.sub(r"{\\.*?}", "", line)
-            line = re.sub(r"^\[.*?\]\s*", "", line)
-            line = re.sub(r"^\(.*?\)\s*", "", line)
-            if line:
-                current_buf.append(line)
-        _flush()
+    Pure (no I/O), so it is deterministic and unit-testable, and the
+    sort-accuracy tests can reproduce production's exact evidence_text from a
+    cached raw SRT. Returns None when there are no cues; falls back to all cues
+    when the whole file fits inside the intro-skip window."""
+    cues: List[Tuple[float, str]] = []
+    current_start: Optional[float] = None
+    current_buf: List[str] = []
 
-        if not cues:
-            return None
+    def _flush():
+        if current_start is not None and current_buf:
+            text = " ".join(current_buf).strip()
+            if text:
+                cues.append((current_start, text))
 
-        filtered = [(t, dlg) for (t, dlg) in cues if t >= skip_head_seconds]
-        if not filtered:
-            filtered = cues
+    for raw_line in srt_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            _flush()
+            current_start = None
+            current_buf = []
+            continue
+        if re.fullmatch(r"\d+", line):
+            continue
+        ts = _SRT_TS_RE.match(line)
+        if ts:
+            _flush()
+            current_start = _srt_ts_to_seconds(ts.group(1), ts.group(2), ts.group(3), ts.group(4))
+            current_buf = []
+            continue
+        line = re.sub(r"</?i>", "", line)
+        line = re.sub(r"</?b>", "", line)
+        line = re.sub(r"</?u>", "", line)
+        line = re.sub(r"{\\.*?}", "", line)
+        line = re.sub(r"^\[.*?\]\s*", "", line)
+        line = re.sub(r"^\(.*?\)\s*", "", line)
+        if line:
+            current_buf.append(line)
+    _flush()
 
-        # Emit "[time]" markers every 60 seconds of timeline so the LLM can
-        # reason about plot ordering ("the meet happens early, the reveal is
-        # near the end"). Markers are small but help long-context reasoning.
-        out: List[str] = []
-        last_minute = -1
-        for t, dlg in filtered:
-            minute = int(t // 60)
-            if minute != last_minute:
-                out.append(f"\n[{minute}m]")
-                last_minute = minute
-            out.append(dlg)
+    if not cues:
+        return None
 
-        joined = " ".join(out).strip()
-        if len(joined) > max_chars:
-            joined = joined[:max_chars]
-        return joined if joined else None
+    filtered = [(t, dlg) for (t, dlg) in cues if t >= skip_head_seconds]
+    if not filtered:
+        filtered = cues
+
+    # Emit "[time]" markers every 60 seconds of timeline so the LLM can
+    # reason about plot ordering ("the meet happens early, the reveal is
+    # near the end"). Markers are small but help long-context reasoning.
+    out: List[str] = []
+    last_minute = -1
+    for t, dlg in filtered:
+        minute = int(t // 60)
+        if minute != last_minute:
+            out.append(f"\n[{minute}m]")
+            last_minute = minute
+        out.append(dlg)
+
+    joined = " ".join(out).strip()
+    if len(joined) > max_chars:
+        joined = joined[:max_chars]
+    return joined if joined else None
+
+
+def extract_subtitle_full(
+    mkv_path: Path,
+    max_chars: int = 60000,
+    skip_head_seconds: float = 300.0,
+) -> Optional[str]:
+    """Pull the full post-intro subtitle dialogue as a single block of text.
+
+    Used by the season-match identifier (bug 152 rewrite): instead of three
+    short windows + concat + 4K-char cap, the LLM sees enough plot beats from
+    the whole episode to disambiguate against the full TMDB synopsis list
+    in a single constrained-choice call. A 22-minute AD episode produces
+    ~10-15K chars of post-intro dialogue, well inside the 60K safety cap
+    and well inside DeepSeek-V3's context window.
+
+    Returns None when subtitles are unavailable / bitmap-only / parse-fails."""
+    txt = _srt_text_from_mkv(mkv_path)
+    if not txt:
+        return None
+    return parse_full_dialogue(txt, max_chars=max_chars, skip_head_seconds=skip_head_seconds)
 
 
 # ----------------------------
@@ -1521,6 +1544,18 @@ def verify_or_correct_with_tmdb(
 # Rename
 # ----------------------------
 
+# Per-file rename log. Every successful rename (real or dry-run) funnels through
+# rename_and_move, so recording here gives a complete src -> (show, season,
+# episode, title) map without instrumenting the many scattered rename paths.
+# Purely additive: production reads it only to enrich the summary JSON, and the
+# sort-accuracy harness reads it to score end-to-end identification per file.
+_RENAME_LOG: List[dict] = []
+
+
+def _reset_rename_log() -> None:
+    _RENAME_LOG.clear()
+
+
 def rename_and_move(
     src: Path,
     show: str,
@@ -1544,11 +1579,23 @@ def rename_and_move(
         print(f"[SKIP ] target exists: {dst}")
         return False
 
+    def _log_rename() -> None:
+        _RENAME_LOG.append({
+            "src": src.name,
+            "folder": src.parent.name,
+            "decision": "renamed",
+            "show": show,
+            "season": season,
+            "episode": ep,
+            "title": title,
+        })
+
     if dry_run:
         if dest_root is not None:
             print(f"[RENAME] DRYRUN {src.name} -> {dst}")
         else:
             print(f"[RENAME] DRYRUN {src.name} -> {new_name}")
+        _log_rename()
         return True
 
     if dest_root is not None:
@@ -1558,6 +1605,7 @@ def rename_and_move(
     else:
         src.rename(dst)
         print(f"[RENAME] {src.name} -> {new_name}")
+    _log_rename()
     return True
 
 
@@ -1565,7 +1613,7 @@ def rename_and_move(
 # Main
 # ----------------------------
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="Root folder containing season/disc folders (or a single folder).")
     ap.add_argument("--dest", default=None,
@@ -1611,7 +1659,11 @@ def main():
                     help="Minimum title similarity (0-1) to confirm/correct using TMDB (default: 0.78).")
     ap.add_argument("--summary-json", default=None,
                     help="Write a JSON run summary to this path for post-build notifications.")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+
+    # Fresh per-file rename log for this run (matters when main() is called
+    # in-process more than once, e.g. by the sort-accuracy harness).
+    _reset_rename_log()
 
     dest_root: Optional[Path] = Path(args.dest).expanduser().resolve() if args.dest else None
 
@@ -3250,6 +3302,42 @@ def main():
             print(f"Removed {removed_dirs} empty director{'y' if removed_dirs == 1 else 'ies'} from {args.root}")
 
     if args.summary_json:
+        # Per-file disposition map (src -> what happened), so consumers can see
+        # the outcome of each ripped title, not just an aggregate list. Built
+        # with precedence (a renamed file wins over a same-name earlier skip)
+        # and deduped by src. Every scanned .mkv is guaranteed an entry: any
+        # file not captured by the rename log / extras_queue / skipped_files
+        # (e.g. counter-only skips that just `continue`) is backfilled as an
+        # unaccounted skip so the map is complete. All sources populate in
+        # dry-run too.
+        results = []
+        _seen = set()
+
+        def _add_result(folder: Optional[str], src_name: Optional[str], rec: dict) -> None:
+            # Key on (folder, filename): different discs rip to identically named
+            # titles, so a filename alone is not unique across folders.
+            if not src_name:
+                return
+            key = (folder, src_name)
+            if key in _seen:
+                return
+            _seen.add(key)
+            results.append(rec)
+
+        for rec in _RENAME_LOG:
+            _add_result(rec.get("folder"), rec.get("src"), rec)
+        for mkv_path, show_name, season_num in extras_queue:
+            _add_result(mkv_path.parent.name, mkv_path.name,
+                        {"src": mkv_path.name, "folder": mkv_path.parent.name,
+                         "decision": "extra", "show": show_name, "season": season_num})
+        for sk in skipped_files:
+            _add_result(None, sk.get("file"),
+                        {"src": sk.get("file"), "decision": "skipped", "reason": sk.get("reason")})
+        for p in mkvs:
+            _add_result(p.parent.name, p.name,
+                        {"src": p.name, "folder": p.parent.name,
+                         "decision": "skipped", "reason": "not identified"})
+
         summary = {
             "total": total,
             "renamed": renamed + dryrun,
@@ -3258,6 +3346,7 @@ def main():
             "renamed_episodes": renamed_episodes,
             "skipped_files": skipped_files,
             "extras_moved": extras_moved,
+            "results": results,
         }
         try:
             Path(args.summary_json).write_text(json.dumps(summary, indent=2))

@@ -108,15 +108,30 @@ def sanitize_title(title: str) -> str:
     return re.sub(r'[<>:"/\\|?*]+', " ", title).strip()
 
 
-def looks_like_tv_disc(folder_name: str, video_files: List[Path]) -> Tuple[bool, str]:
-    """Heuristic: is this folder an episodic TV disc rather than a movie?
+# Routing thresholds, named so tests and the function read the same constants.
+FEATURE_LENGTH_SECONDS = 70 * 60   # a title this long is a real movie feature
+SUBSTANTIAL_SECONDS    = 5 * 60    # shorter than this is a menu / trailer / logo sting
+MIN_EPISODE_TITLES     = 3         # this many substantial short titles => episodic disc
+SIZE_SIMILARITY_RATIO  = 0.7       # fallback: "similar size" threshold vs the largest title
+MIN_SIMILAR_TITLES     = 4         # fallback: this many similar titles => episodic disc
 
-    Movie discs have one dominant feature file (plus maybe a couple of small
-    extras). TV discs have several similarly-sized titles (the episodes) and
-    often a season/episode marker in the disc/folder name. When this returns
-    True the folder is left for Sort_TV.py instead of being force-matched
-    against TMDB's movie index (which fuzzy-matches short show names like
-    "Bluey" and wrongly files a single episode as a movie).
+
+def classify_disc_routing(
+    folder_name: str,
+    sizes_bytes: List[int],
+    durations_seconds: List[Optional[float]],
+) -> Tuple[bool, str]:
+    """Pure movie-vs-TV routing decision from already-gathered title features.
+
+    Kept free of filesystem / ffprobe access so it can be exercised directly by
+    the ground-truth routing tests (fixtures/sort_groundtruth) without any media
+    files present. ``looks_like_tv_disc`` is the thin wrapper that gathers the
+    features from real files and calls this.
+
+    ``sizes_bytes`` and ``durations_seconds`` are parallel per-title lists;
+    a duration entry may be ``None`` when ffprobe could not read it.
+
+    Returns ``(is_tv, reason)``.
     """
     # High-confidence name markers. Bare "Disc N" is deliberately excluded
     # because multi-disc movie releases use it too.
@@ -127,37 +142,56 @@ def looks_like_tv_disc(folder_name: str, video_files: List[Path]) -> Tuple[bool,
     if re.search(r"\bS\d{1,2}[\s._-]*E\d{1,3}\b", folder_name, flags=re.IGNORECASE):
         return True, "folder name has an SxxExx marker"
 
-    # Structural signal: several similarly-sized titles => episodic disc.
-    # A movie's main feature dominates total size; episodes are each ~1/N.
-    sized = sorted(
-        ((f, f.stat().st_size) for f in video_files),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    if len(sized) < 4:
-        return False, ""
-    largest = sized[0][1]
-    if largest <= 0:
-        return False, ""
-    similar = [(f, s) for f, s in sized if s >= 0.7 * largest]
-    if len(similar) < 4:
+    n_titles = max(len(sizes_bytes), len(durations_seconds))
+    if n_titles < 3:
         return False, ""
 
-    # Disambiguate via duration: many movie discs (esp. Disney/Pixar) expose
-    # the same feature as multiple large playlists — alternate audio mixes or
-    # language variants — and MakeMKV rips each as its own title. Those share
-    # a feature-length duration (>=75 min). TV episodes cluster at 20-60 min,
-    # so the median duration tells them apart when sizes alone look episodic.
-    durations = []
-    for f, _ in similar:
-        d = ffprobe_duration_seconds(f)
-        if d is not None and d > 0:
-            durations.append(d)
-    if durations:
-        median = sorted(durations)[len(durations) // 2]
-        if median >= 75 * 60:
+    # Duration is the most reliable structural signal. A movie disc always has
+    # one feature-length main title; everything else on it is short extras. An
+    # episodic disc has several short titles and NO feature-length one, even
+    # when the episodes vary in length (e.g. a double-length special plus
+    # single-length episodes on a kids' compilation disc, which defeats a pure
+    # size-similarity test: the special can be ~2x the size of each episode yet
+    # they are all still episodes).
+    durations = [d for d in durations_seconds if d is not None and d > 0]
+    if len(durations) >= 3:
+        longest = max(durations)
+        # A genuine feature-length main title => movie disc (with extras). This
+        # also covers movie discs that expose the feature as several large
+        # playlist variants (alternate audio mixes / languages), all feature-length.
+        if longest >= FEATURE_LENGTH_SECONDS:
             return False, ""
+        substantial = [d for d in durations if d >= SUBSTANTIAL_SECONDS]
+        if len(substantial) >= MIN_EPISODE_TITLES:
+            return True, (
+                f"{len(substantial)} short titles (longest {longest / 60:.0f} min, "
+                f"no feature-length main) suggest an episodic disc"
+            )
+        return False, ""
+
+    # Fallback when durations are unavailable (ffprobe failed): fall back to the
+    # older size-similarity signal: several similarly-sized titles => episodic.
+    sized = sorted((s for s in sizes_bytes if s and s > 0), reverse=True)
+    if len(sized) < MIN_SIMILAR_TITLES or sized[0] <= 0:
+        return False, ""
+    similar = [s for s in sized if s >= SIZE_SIMILARITY_RATIO * sized[0]]
+    if len(similar) < MIN_SIMILAR_TITLES:
+        return False, ""
     return True, f"{len(similar)} similarly-sized titles suggest an episodic disc"
+
+
+def looks_like_tv_disc(folder_name: str, video_files: List[Path]) -> Tuple[bool, str]:
+    """Is this folder an episodic TV disc rather than a movie?
+
+    Gathers per-title size + duration from the ripped files and defers the
+    decision to ``classify_disc_routing``. When this returns True the folder is
+    left for Sort_TV.py instead of being force-matched against TMDB's movie
+    index (which fuzzy-matches short show names like "Bluey" and wrongly files a
+    single episode as a movie).
+    """
+    sizes_bytes = [f.stat().st_size for f in video_files]
+    durations_seconds = [ffprobe_duration_seconds(f) for f in video_files]
+    return classify_disc_routing(folder_name, sizes_bytes, durations_seconds)
 
 
 # ─── subtitle extraction ─────────────────────────────────────────────────────
