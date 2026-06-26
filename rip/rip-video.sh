@@ -2,6 +2,10 @@
 DRIVE="$1"
 STAGING="/mnt/media/Video"
 LOG="/var/log/rip-video.log"
+# Durable archive of rip manifests (raw "what each title was named" provenance).
+# Kept outside the staging tree so it survives sorting + cleanup; this is the pool
+# we later hand-label a sample of for the sort-accuracy tests.
+MANIFEST_ARCHIVE="/mnt/media/rip_manifests"
 
 source /opt/appinsights/ai-track.sh
 
@@ -86,6 +90,96 @@ if [ $STATUS -eq 0 ]; then
 else
   echo "[$(date)] ERROR: Rip failed with status $STATUS" >> "$LOG"
   ai_trace "rip-video" "Error" "Rip failed" "drive=$DRIVE" "disc_title=$DISC_TITLE" "exit_status=$STATUS"
+fi
+
+# Record raw provenance for the sort-accuracy dataset on EVERY rip (success or
+# partial). This is only the pre-sort input the sorter will see: the disc title
+# plus each title's output filename, duration, and size (from the makemkvcon info
+# blob in $INFO). It contains NO labels; humans hand-label a sample of these
+# later for the accuracy tests. A copy lives next to the rip and a durable copy
+# goes to $MANIFEST_ARCHIVE so it survives sorting + cleanup. Best-effort: never
+# let manifest writing fail the rip.
+if command -v python3 >/dev/null 2>&1; then
+  mkdir -p "$MANIFEST_ARCHIVE" 2>/dev/null
+  INFO_TMP=$(mktemp)
+  printf '%s' "$INFO" > "$INFO_TMP"
+  python3 - "$INFO_TMP" "$OUTPUT_DIR" "$DISC_TITLE" "$DRIVE" "$MANIFEST_ARCHIVE" <<'PYEOF' >> "$LOG" 2>&1 || echo "[$(date)] WARNING: rip_manifest.json not written" >> "$LOG"
+import json, os, re, sys
+from datetime import date
+
+info_path, out_dir, disc_title, drive, archive_dir = sys.argv[1:6]
+
+# makemkvcon -r info TINFO format: TINFO:<title>,<attr>,<code>,"<value>"
+# attr 9 = duration (H:MM:SS), 11 = size in bytes, 27 = output file name.
+ATTR_DURATION, ATTR_SIZE, ATTR_FILENAME = 9, 11, 27
+row = re.compile(r'^TINFO:(\d+),(\d+),\d+,"(.*)"\s*$')
+
+titles = {}
+with open(info_path, encoding="utf-8", errors="ignore") as fh:
+    for line in fh:
+        m = row.match(line.strip())
+        if not m:
+            continue
+        tid, attr, val = int(m.group(1)), int(m.group(2)), m.group(3)
+        titles.setdefault(tid, {})[attr] = val
+
+def dur_to_seconds(s):
+    parts = (s or "").split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except ValueError:
+        return None
+    sec = 0
+    for p in parts:
+        sec = sec * 60 + p
+    return sec if sec > 0 else None
+
+out_titles = []
+for tid in sorted(titles):
+    attrs = titles[tid]
+    src = attrs.get(ATTR_FILENAME)
+    info_size = attrs.get(ATTR_SIZE)
+    info_size = int(info_size) if (info_size or "").isdigit() else None
+    # A title can fail to save (copy-protected / bad sector). Reflect what is
+    # actually on disk so a fixture only contains files the sorter really sees,
+    # and prefer the real on-disk size when present.
+    path = os.path.join(out_dir, src) if src else None
+    saved = bool(path and os.path.isfile(path))
+    size_bytes = os.path.getsize(path) if saved else info_size
+    out_titles.append({
+        "index": tid,
+        "src": src,
+        "duration_s": dur_to_seconds(attrs.get(ATTR_DURATION)),
+        "size_bytes": size_bytes,
+        "saved": saved,
+    })
+
+manifest = {
+    "schema_version": 1,
+    "disc_title": disc_title,
+    "ripped_at": date.today().isoformat(),
+    "source": "makemkv",
+    "drive": drive,
+    "titles": out_titles,
+}
+
+payload = json.dumps(manifest, indent=2)
+with open(os.path.join(out_dir, "rip_manifest.json"), "w", encoding="utf-8") as fh:
+    fh.write(payload)
+
+# Durable archive copy, keyed by disc title + date so re-rips do not clobber.
+safe = re.sub(r"[^A-Za-z0-9._-]+", "_", disc_title).strip("_") or "disc"
+archive_name = f"{safe}__{date.today().isoformat()}.json"
+try:
+    with open(os.path.join(archive_dir, archive_name), "w", encoding="utf-8") as fh:
+        fh.write(payload)
+except OSError as e:
+    print(f"WARNING: could not archive manifest: {e}")
+
+saved_n = sum(1 for t in out_titles if t["saved"])
+print(f"rip_manifest.json written: {len(out_titles)} titles ({saved_n} saved)")
+PYEOF
+  rm -f "$INFO_TMP"
 fi
 
 echo "[$(date)] Ejecting $DRIVE..." >> "$LOG"
