@@ -82,13 +82,13 @@ VIDEO_EXTS = {e.lower() for e in DEFAULT_EXTENSIONS}
 # sync with the staging functions (stage_movies / stage_tv) so the Jenkins log
 # explains what each index actually tests.
 RIPS_PATTERNS = {
-    1: "folder hints title (e.g. MENINBLACK / MIBMOVIE)",
-    2: "folder constant MOVIEFOLDER_NNN (no hint)",
+    1: "With title hint",
+    2: "No title hint",
 }
 TV_PATTERNS = {
-    1: "show + season in folder name",
-    2: "show in folder name, season hidden",
-    3: "fully blind (random folder token, no show/season)",
+    1: "Show + season known",
+    2: "Show known, season hidden",
+    3: "Fully blind (no show/season)",
 }
 EPISODE_RE = re.compile(
     r"^(?P<show>.+?)\s*-\s*S(?P<s>\d{1,2})E(?P<e>\d{1,3})\s*-\s*(?P<title>.+)\.(?P<ext>[A-Za-z0-9]+)$"
@@ -793,6 +793,14 @@ def main() -> int:
                     pass
 
         print_report(results)
+
+        # Stamp the human-readable pattern label into each index's results so
+        # downstream consumers (the Discord notify script) don't need to know the
+        # index numbering.
+        for _idx, _r in results.get("rips", {}).items():
+            _r["label"] = RIPS_PATTERNS.get(int(_idx), f"index {_idx}")
+        for _idx, _r in results.get("tv", {}).items():
+            _r["label"] = TV_PATTERNS.get(int(_idx), f"index {_idx}")
 
         summary = {
             "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),

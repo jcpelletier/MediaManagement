@@ -45,8 +45,9 @@ if rips:
     for idx in sorted(rips):
         r = rips[idx]
         t = r.get("total", 0)
+        label = r.get("label", f"Index {idx}")
         lines.append(
-            f"  • Index {idx}: title {r.get('title_correct',0)}/{t} "
+            f"  • {label}: title {r.get('title_correct',0)}/{t} "
             f"({pct(r.get('title_correct',0), t)}), "
             f"+year {r.get('title_year_correct',0)}/{t}, miss {r.get('miss',0)}"
         )
@@ -57,8 +58,9 @@ if tv:
     for idx in sorted(tv):
         r = tv[idx]
         t = r.get("total", 0)
+        label = r.get("label", f"Index {idx}")
         lines.append(
-            f"  • Index {idx}: episode {r.get('episode_correct',0)}/{t} "
+            f"  • {label}: episode {r.get('episode_correct',0)}/{t} "
             f"({pct(r.get('episode_correct',0), t)}), "
             f"season {r.get('season_correct',0)}/{t}, "
             f"extras {r.get('extras',0)}, miss {r.get('miss',0)}"
