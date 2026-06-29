@@ -499,7 +499,8 @@ def run_subprocess(cmd: List[str], log_path: Path, env: Optional[dict]) -> int:
 
 def run_sort_rips(source: Path, dest: Path, processed: Path, no_audio: bool,
                   summary_json: Path, whisper_model: Optional[str],
-                  log_path: Path, env: Optional[dict]) -> int:
+                  log_path: Path, env: Optional[dict],
+                  transcript_cache: Optional[Path] = None) -> int:
     cmd = [
         sys.executable, str(SCRIPT_DIR / "Sort_Rips.py"),
         "--source", str(source),
@@ -509,6 +510,8 @@ def run_sort_rips(source: Path, dest: Path, processed: Path, no_audio: bool,
     ]
     if whisper_model:
         cmd += ["--whisper-model", whisper_model]
+    if transcript_cache:
+        cmd += ["--transcript-cache", str(transcript_cache)]
     if no_audio:
         cmd.append("--no-whisper-fallback")
     return run_subprocess(cmd, log_path, env)
@@ -529,6 +532,60 @@ def run_sort_tv(root: Path, dest: Path, no_audio: bool, summary_json: Path,
     return run_subprocess(cmd, log_path, env)
 
 
+# ---------------------------- transcript cache fill ----------------------------
+# Sort_Rips writes the cache as it transcribes during a run. This is the harness's
+# "also write it if missing" backstop: after the passes, transcribe (once) any
+# sampled movie whose first-clip transcript is still absent, so the next run is
+# fully cache-served. Keyed identically to Sort_Rips (size+duration+model+window).
+
+def _load_whisper_model(model_name: str):
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except ImportError:
+        return None
+    for device, compute in (("cuda", "float16"), ("cuda", "int8"), ("cpu", "int8")):
+        try:
+            return WhisperModel(model_name, device=device, compute_type=compute)
+        except Exception:
+            continue
+    return None
+
+
+def fill_transcript_cache(movies: List[MovieGT], cache_dir: Optional[Path],
+                          model_name: str) -> None:
+    if not cache_dir:
+        return
+    try:
+        import Sort_Rips as SR  # type: ignore
+    except Exception:
+        print("[CACHE] Sort_Rips unavailable; skipping transcript-cache fill.")
+        return
+
+    start = SR.WHISPER_INTERVAL_SECONDS_DEFAULT       # first clip: 5 min in
+    base = SR.WHISPER_BASE_SECONDS_DEFAULT            # 60s
+    todo = []
+    for mv in movies:
+        dur = SR.ffprobe_duration_seconds(mv.real_path)
+        if dur is None or start + 1.0 >= dur:
+            continue  # Sort_Rips would not take a first clip here either
+        seconds = min(base, dur - start - 1.0)
+        size = mv.real_path.stat().st_size
+        if SR.load_cached_transcript(cache_dir, size, dur, model_name, start, seconds) is None:
+            todo.append((mv, size, dur, seconds))
+
+    if not todo:
+        print(f"[CACHE] transcript cache already complete for {len(movies)} sampled movie(s).")
+        return
+    model = _load_whisper_model(model_name)
+    if model is None:
+        print(f"[CACHE] {len(todo)} transcript(s) missing but no Whisper model loaded; skipping fill.")
+        return
+    print(f"[CACHE] filling {len(todo)} missing transcript(s) with model '{model_name}'...")
+    for mv, size, dur, seconds in todo:
+        SR.get_clip_transcript(mv.real_path, size, dur, start, seconds, model, model_name, cache_dir)
+    print("[CACHE] transcript-cache fill done.")
+
+
 # ---------------------------- per-pass workers ----------------------------
 
 def job_rips(idx: int, sampled: List[MovieGT], run_dir: Path, args, threads: int,
@@ -543,7 +600,8 @@ def job_rips(idx: int, sampled: List[MovieGT], run_dir: Path, args, threads: int
         sampled, src, idx, args.link_mode, rng,
         label_index=label_index if idx == 1 else None)
     rc = run_sort_rips(src, out, proc, args.no_audio_fallback, summ,
-                       args.whisper_model, log, child_env(threads))
+                       args.whisper_model, log, child_env(threads),
+                       transcript_cache=getattr(args, "transcript_cache", None))
     return {"script": "rips", "idx": str(idx),
             "result": score_rips(keymap, out, [src, proc], label_sources),
             "log": log, "mode": mode, "n": len(keymap), "rc": rc}
@@ -883,6 +941,12 @@ def parse_args() -> argparse.Namespace:
                          "is found. Movies with no match keep the synthetic label.")
     ap.add_argument("--no-real-labels", action="store_true",
                     help="Ignore rip manifests; always use the synthetic Index-1 labels.")
+    ap.add_argument("--transcript-cache", type=Path, default=Path("/mnt/media/.transcript_cache"),
+                    help="Shared transcript cache dir passed to Sort_Rips. On by default so repeat "
+                         "runs reuse Whisper transcripts instead of re-transcribing. After each run "
+                         "the harness fills any still-missing entries for the sampled movies.")
+    ap.add_argument("--no-transcript-cache", action="store_true",
+                    help="Disable the transcript cache (always re-transcribe).")
     return ap.parse_args()
 
 
@@ -908,6 +972,10 @@ def main() -> int:
 
     if args.fast and not args.whisper_model:
         args.whisper_model = "base"
+
+    # Transcript cache: on by default; job_rips reads it off args and passes it to
+    # Sort_Rips. Disabled by --no-transcript-cache.
+    args.transcript_cache = None if args.no_transcript_cache else args.transcript_cache
 
     run_id = "run_" + _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = staging_root / run_id
@@ -989,6 +1057,13 @@ def main() -> int:
                     pass
 
         print_report(results)
+
+        # Backstop: ensure every sampled movie has a cached first-clip transcript
+        # so the next run is fully cache-served (Sort_Rips already wrote most of
+        # them during the passes). Skipped when audio is off (no transcripts).
+        if rips_indexes and args.transcript_cache and not args.no_audio_fallback:
+            fill_transcript_cache(sampled_movies, args.transcript_cache,
+                                  args.whisper_model or "base")
 
         # Stamp the human-readable pattern label into each index's results so
         # downstream consumers (the Discord notify script) don't need to know the
