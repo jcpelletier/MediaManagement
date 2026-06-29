@@ -78,6 +78,26 @@ except Exception:  # pragma: no cover - import side effects only matter on panda
 TITLE_MATCH_THRESHOLD = 0.90
 VIDEO_EXTS = {e.lower() for e in DEFAULT_EXTENSIONS}
 
+# A correct identification can still differ from the library's folder name when
+# TMDB's canonical title carries a subtitle the library omits — e.g. the sorter
+# produces "The Water Horse: Legend of the Deep" but the library folder is "The
+# Water Horse". Same movie, fuller title. This separator-gated check accepts that
+# without accepting sequels ("Cars" vs "Cars 2") or franchise siblings
+# ("Bourne Ultimatum" vs "Bourne Identity") — it only matches when the shorter
+# title equals the *root* (text before a ': '/' - ' subtitle separator) of the
+# longer one.
+_SUBTITLE_SEP_RE = re.compile(r"\s*[:–—-]\s+")
+
+
+def titles_same_movie(a: str, b: str) -> bool:
+    """True if one title is the other plus a colon/dash-introduced subtitle."""
+    na, nb = norm_title(a), norm_title(b)
+    if not na or not nb or na == nb:
+        return False
+    root_a = norm_title(_SUBTITLE_SEP_RE.split(a, 1)[0])
+    root_b = norm_title(_SUBTITLE_SEP_RE.split(b, 1)[0])
+    return na == root_b or nb == root_a
+
 # Human-readable labels for the obfuscation pattern each index applies. Kept in
 # sync with the staging functions (stage_movies / stage_tv) so the Jenkins log
 # explains what each index actually tests.
@@ -670,7 +690,8 @@ def score_rips(keymap: Dict[Tuple[int, int], MovieGT], out_dir: Path,
             id_title = m.group("title").strip() if m else folder.strip()
             id_year = int(m.group("year")) if m else None
             ok_title = (norm_title(id_title) == norm_title(gt.title)
-                        or similarity(id_title, gt.title) >= TITLE_MATCH_THRESHOLD)
+                        or similarity(id_title, gt.title) >= TITLE_MATCH_THRESHOLD
+                        or titles_same_movie(id_title, gt.title))
             row["correct_title"] = ok_title
             row["correct_year"] = bool(ok_title and gt.year is not None and id_year == gt.year)
             if ok_title:
