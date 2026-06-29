@@ -824,9 +824,10 @@ def _print_rips_label_sources(items: List[dict]) -> None:
     breakdown = _rips_source_breakdown(items)
     if not ({"real", "cohortA", "cohortB"} & set(breakdown)):
         return
-    order = ["real", "cohortA", "cohortB", "blind", "?"]
+    # Order by accuracy ascending so it reads in the same direction as the range.
+    order = sorted(breakdown, key=lambda s: (breakdown[s][0] / breakdown[s][1] if breakdown[s][1] else 0, s))
     parts = [f"{_LABEL_SOURCE_NAMES.get(s, s)}: {c}/{n} ({pct(c, n)})"
-             for s in order if s in breakdown
+             for s in order
              for (c, n) in [breakdown[s]]]
     print("  by label source -> " + "   ".join(parts))
 

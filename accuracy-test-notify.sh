@@ -64,10 +64,12 @@ if rips:
         label = r.get("label", f"Index {idx}")
         hint = cohort_breakdown(r.get("items", []))
         if len(hint) >= 2:
-            order = [s for s in ("real", "cohortA", "cohortB") if s in hint]
+            # Order cohorts by accuracy ascending so the detail reads in the same
+            # direction as the low–high range.
+            order = sorted(hint, key=lambda s: (hint[s][0] / hint[s][1], s))
             pcts = [100.0 * hint[s][0] / hint[s][1] for s in order]
             detail = ", ".join(f"{COHORT_NAMES[s]} {hint[s][0]}/{hint[s][1]}" for s in order)
-            lines.append(f"  • {label}: {min(pcts):.0f}%–{max(pcts):.0f}%  ({detail})")
+            lines.append(f"  • {label}: {pcts[0]:.0f}%–{pcts[-1]:.0f}%  ({detail})")
         else:
             lines.append(
                 f"  • {label}: title {r.get('title_correct',0)}/{t} "
