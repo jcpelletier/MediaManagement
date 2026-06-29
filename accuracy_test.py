@@ -248,6 +248,122 @@ def harvest_shows(shows_root: Path) -> List[Season]:
     return result
 
 
+# ---------------------------- real disc labels ----------------------------
+# Index 1 ("with title hint") normally mangles the real title into a synthetic
+# stand-in (MENINBLACK / MIBMOVIE). When rip_manifest.json archives are present
+# we instead feed Sort_Rips the *real* MakeMKV disc volume label captured at rip
+# time — the exact string production sees. A manifest is written pre-sort (it has
+# no final "Title (Year)"), so each is joined back to a library movie by its main
+# feature's duration (which survives the Nightly_Convert re-encode), with an
+# exact byte-size fast path for not-yet-converted rips. The label is attached
+# verbatim; movies with no matching manifest keep the synthetic scheme.
+
+@dataclass
+class RipLabel:
+    disc_title: str
+    main_duration_s: Optional[float]
+    main_size_bytes: Optional[int]
+
+
+def _manifest_main_title(titles: List[dict]) -> Optional[dict]:
+    """The feature title of a movie disc = the longest one that actually saved."""
+    saved = [t for t in titles if t.get("saved")] or list(titles)
+    if not saved:
+        return None
+    return max(saved, key=lambda t: (t.get("duration_s") or 0, t.get("size_bytes") or 0))
+
+
+def load_rip_labels(manifests_dir: Optional[Path]) -> List[RipLabel]:
+    out: List[RipLabel] = []
+    if not manifests_dir or not manifests_dir.is_dir():
+        return out
+    for jf in sorted(manifests_dir.glob("*.json")):
+        try:
+            m = json.loads(jf.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        disc = (m.get("disc_title") or "").strip()
+        if not disc:
+            continue
+        main = _manifest_main_title(m.get("titles") or []) or {}
+        out.append(RipLabel(
+            disc_title=disc,
+            main_duration_s=main.get("duration_s"),
+            main_size_bytes=main.get("size_bytes"),
+        ))
+    return out
+
+
+def probe_duration_seconds(path: Path) -> Optional[float]:
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        return float(proc.stdout.strip())
+    except (ValueError, OSError):
+        return None
+
+
+def safe_disc_folder(disc_title: str) -> str:
+    """Keep the real label verbatim except for path-illegal characters, so the
+    sorter sees exactly what MakeMKV produced."""
+    s = disc_title.replace("/", "_").replace("\0", "").strip().strip(".")
+    return s or "DISC"
+
+
+class RealLabelIndex:
+    """Attaches real MakeMKV disc labels to sampled movies. A disc holds a single
+    movie, so each manifest is consumed at most once per pass (the caller passes a
+    ``used`` set of indices into ``self.labels``)."""
+
+    DURATION_TOL_FLOOR_S = 10.0
+
+    def __init__(self, labels: List[RipLabel]):
+        self.labels = [l for l in labels if l.main_duration_s or l.main_size_bytes]
+
+    def __bool__(self) -> bool:
+        return bool(self.labels)
+
+    def label_for(self, mv: MovieGT, used: set) -> Optional[str]:
+        """Real disc label for this movie, or None if no manifest matches.
+        ``used`` indices are excluded and the chosen one is added to it."""
+        if not self.labels:
+            return None
+        try:
+            size: Optional[int] = mv.real_path.stat().st_size
+        except OSError:
+            size = None
+
+        # 1) Exact byte-size match (rip not yet re-encoded): physically unambiguous.
+        if size:
+            exact = [i for i, l in enumerate(self.labels)
+                     if i not in used and l.main_size_bytes == size]
+            if exact:
+                pick = max(exact, key=lambda i: similarity(self.labels[i].disc_title, mv.title))
+                used.add(pick)
+                return safe_disc_folder(self.labels[pick].disc_title)
+
+        # 2) Duration match within tolerance (survives the Nightly_Convert re-encode).
+        dur = probe_duration_seconds(mv.real_path)
+        if dur:
+            tol = max(self.DURATION_TOL_FLOOR_S, 0.01 * dur)
+            cands = [i for i, l in enumerate(self.labels)
+                     if i not in used and l.main_duration_s is not None
+                     and abs(l.main_duration_s - dur) <= tol]
+            if cands:
+                # Disambiguate duration collisions by which label best resembles
+                # the movie's real title (the disc IS labeled for that movie).
+                pick = max(cands, key=lambda i: (
+                    similarity(self.labels[i].disc_title, mv.title),
+                    -abs((self.labels[i].main_duration_s or 0) - dur),
+                ))
+                used.add(pick)
+                return safe_disc_folder(self.labels[pick].disc_title)
+        return None
+
+
 # ---------------------------- sampling ----------------------------
 
 def sample_movies(movies: List[MovieGT], limit: Optional[int], rng: random.Random) -> List[MovieGT]:
@@ -291,22 +407,32 @@ def discs_for_season(season: Season, eps_per_disc: int) -> List[List[EpisodeGT]]
 
 
 def stage_movies(movies: List[MovieGT], dest_dir: Path, index: int, mode: str,
-                 rng: random.Random) -> Tuple[Dict[Tuple[int, int], MovieGT], str]:
-    """Build one obfuscated source tree for Sort_Rips. Returns key->GT map and link mode used."""
+                 rng: random.Random, label_index: Optional["RealLabelIndex"] = None
+                 ) -> Tuple[Dict[Tuple[int, int], MovieGT], str, Dict[Tuple[int, int], str]]:
+    """Build one obfuscated source tree for Sort_Rips. Returns key->GT map, the
+    link mode used, and key->label-source ("real" | "synthetic" | "blind")."""
     keymap: Dict[Tuple[int, int], MovieGT] = {}
+    label_sources: Dict[Tuple[int, int], str] = {}
     used_folders: set = set()
+    used_discs: set = set()
     link_used = mode
     for i, mv in enumerate(movies):
-        if index == 1:
+        real_label = label_index.label_for(mv, used_discs) if (index == 1 and label_index) else None
+        if real_label is not None:
+            base = real_label
+            label_sources[mv.key] = "real"
+        elif index == 1:
             base = squash_title(mv.title) if (i % 2 == 0) else acronym_label(mv.title)
+            label_sources[mv.key] = "synthetic"
         else:
             base = f"MOVIEFOLDER_{i + 1:03d}"
+            label_sources[mv.key] = "blind"
         folder = uniquify(base, used_folders)
         ext = mv.real_path.suffix
         dest = dest_dir / folder / f"{rand_token()}{ext}"
         link_used = make_link(mv.real_path, dest, mode)
         keymap[mv.key] = mv
-    return keymap, link_used
+    return keymap, link_used, label_sources
 
 
 def stage_tv(seasons: List[Season], dest_dir: Path, index: int, eps_per_disc: int,
@@ -396,17 +522,21 @@ def run_sort_tv(root: Path, dest: Path, no_audio: bool, summary_json: Path,
 
 # ---------------------------- per-pass workers ----------------------------
 
-def job_rips(idx: int, sampled: List[MovieGT], run_dir: Path, args, threads: int) -> dict:
+def job_rips(idx: int, sampled: List[MovieGT], run_dir: Path, args, threads: int,
+             label_index: Optional["RealLabelIndex"] = None) -> dict:
     src = run_dir / f"rips_idx{idx}"
     out = run_dir / f"out_rips_idx{idx}"
     proc = run_dir / f"proc_rips_idx{idx}"
     summ = run_dir / f"rips_idx{idx}_summary.json"
     log = run_dir / f"rips_idx{idx}.log"
     rng = random.Random(args.seed + 100 + idx)
-    keymap, mode = stage_movies(sampled, src, idx, args.link_mode, rng)
+    keymap, mode, label_sources = stage_movies(
+        sampled, src, idx, args.link_mode, rng,
+        label_index=label_index if idx == 1 else None)
     rc = run_sort_rips(src, out, proc, args.no_audio_fallback, summ,
                        args.whisper_model, log, child_env(threads))
-    return {"script": "rips", "idx": str(idx), "result": score_rips(keymap, out, [src, proc]),
+    return {"script": "rips", "idx": str(idx),
+            "result": score_rips(keymap, out, [src, proc], label_sources),
             "log": log, "mode": mode, "n": len(keymap), "rc": rc}
 
 
@@ -437,7 +567,9 @@ def _walk_video_files(root: Path):
 
 
 def score_rips(keymap: Dict[Tuple[int, int], MovieGT], out_dir: Path,
-               leftover_dirs: List[Path]) -> dict:
+               leftover_dirs: List[Path],
+               label_sources: Optional[Dict[Tuple[int, int], str]] = None) -> dict:
+    label_sources = label_sources or {}
     # key -> identified "Title (Year)" folder name
     identified: Dict[Tuple[int, int], str] = {}
     for p in _walk_video_files(out_dir):
@@ -458,7 +590,8 @@ def score_rips(keymap: Dict[Tuple[int, int], MovieGT], out_dir: Path,
     title_correct = title_year_correct = wrong = miss = unmapped = 0
     for key, gt in keymap.items():
         row = {"gt_title": gt.title, "gt_year": gt.year, "identified": None,
-               "correct_title": False, "correct_year": False, "outcome": ""}
+               "correct_title": False, "correct_year": False, "outcome": "",
+               "label_source": label_sources.get(key, "")}
         if key in identified:
             folder = identified[key]
             row["identified"] = folder
@@ -579,6 +712,31 @@ def _fmt_episode_gt(row: dict) -> str:
     return f"{row['show']} S{row['season']:02d}E{row['episode']:02d}{suffix}"
 
 
+def _rips_source_breakdown(items: List[dict]) -> Dict[str, Tuple[int, int]]:
+    """correct/total title accuracy grouped by label source."""
+    by_src: Dict[str, List[int]] = {}
+    for row in items:
+        src = row.get("label_source") or "?"
+        agg = by_src.setdefault(src, [0, 0])
+        agg[1] += 1
+        if row.get("correct_title"):
+            agg[0] += 1
+    return {s: (c, n) for s, (c, n) in by_src.items()}
+
+
+def _print_rips_label_sources(items: List[dict]) -> None:
+    """When real disc labels were used, break the accuracy out by source so the
+    realistic ('real') number is visible next to the synthetic stand-ins."""
+    breakdown = _rips_source_breakdown(items)
+    if "real" not in breakdown:
+        return
+    order = ["real", "synthetic", "blind", "?"]
+    parts = [f"{s}: {c}/{n} ({pct(c, n)})"
+             for s in order if s in breakdown
+             for (c, n) in [breakdown[s]]]
+    print("  by label source -> " + "   ".join(parts))
+
+
 def _print_rips_failures(items: List[dict]) -> None:
     buckets = {"wrong_title": [], "unidentified": [], "unmapped": []}
     for row in items:
@@ -598,7 +756,8 @@ def _print_rips_failures(items: List[dict]) -> None:
         print(f"  {label}:")
         for row in rows:
             got = row.get("identified") or "(no folder)"
-            print(f"    - {_fmt_movie_gt(row)}  ->  got: {got}")
+            tag = {"real": " [real-label]", "synthetic": " [synthetic]"}.get(row.get("label_source"), "")
+            print(f"    - {_fmt_movie_gt(row)}{tag}  ->  got: {got}")
 
 
 def _print_tv_failures(items: List[dict]) -> None:
@@ -650,6 +809,7 @@ def print_report(results: dict) -> None:
         print(f"  title {r['title_correct']}/{t} ({pct(r['title_correct'], t)})  "
               f"title+year {r['title_year_correct']}/{t}  wrong {r['wrong']}  miss {r['miss']}"
               + (f"  unmapped {r['unmapped']}" if r['unmapped'] else ""))
+        _print_rips_label_sources(r.get("items", []))
         _print_rips_failures(r.get("items", []))
     tv = results.get("tv", {})
     for idx in sorted(tv):
@@ -696,6 +856,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fast", action="store_true",
                     help="Speed preset for large sweeps: uses the 'base' Whisper model unless "
                          "--whisper-model is given. Opt-in; off = production-faithful models.")
+    ap.add_argument("--rip-manifests", type=Path, default=Path("/mnt/media/rip_manifests"),
+                    help="Dir of rip_manifest.json archives. Index 1 ('with title hint') feeds "
+                         "Sort_Rips the real MakeMKV disc label from a matching manifest (joined "
+                         "by main-feature duration/size) instead of a synthetic stand-in when one "
+                         "is found. Movies with no match keep the synthetic label.")
+    ap.add_argument("--no-real-labels", action="store_true",
+                    help="Ignore rip manifests; always use the synthetic Index-1 labels.")
     return ap.parse_args()
 
 
@@ -735,10 +902,19 @@ def main() -> int:
 
         sampled_movies: List[MovieGT] = []
         sampled_seasons: List[Season] = []
+        label_index: Optional[RealLabelIndex] = None
         if rips_indexes:
             movies = harvest_movies(movies_root)
             sampled_movies = sample_movies(movies, limit, rng)
             print(f"[RIPS] {len(sampled_movies)}/{len(movies)} movies sampled.")
+            if 1 in rips_indexes and not args.no_real_labels:
+                label_index = RealLabelIndex(load_rip_labels(args.rip_manifests))
+                if label_index:
+                    print(f"[RIPS] Index 1 will use real disc labels where available "
+                          f"({len(label_index.labels)} manifest(s) in {args.rip_manifests}).")
+                else:
+                    print(f"[RIPS] no rip manifests in {args.rip_manifests}; "
+                          f"Index 1 uses synthetic labels.")
         if tv_indexes:
             seasons = harvest_shows(shows_root)
             sampled_seasons = sample_seasons(seasons, limit, rng)
@@ -768,7 +944,7 @@ def main() -> int:
         futures = {}
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for idx in rips_indexes:
-                futures[ex.submit(job_rips, idx, sampled_movies, run_dir, args, threads)] = ("rips", idx)
+                futures[ex.submit(job_rips, idx, sampled_movies, run_dir, args, threads, label_index)] = ("rips", idx)
             for idx in tv_indexes:
                 futures[ex.submit(job_tv, idx, sampled_seasons, run_dir, args, eps_per_disc, threads)] = ("tv", idx)
             print(f"\nLaunched {len(futures)} pass(es); logs print below as each finishes.\n")
