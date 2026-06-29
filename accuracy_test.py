@@ -800,6 +800,19 @@ _LABEL_SOURCE_NAMES = {
 }
 
 
+def _rips_range(items: List[dict]) -> Optional[Tuple[float, float]]:
+    """(low%, high%) title accuracy across the hint-quality cohorts (real /
+    Cohort A / Cohort B), or None when fewer than two are present. Reporting the
+    span — worst label quality to best — avoids a single blended average that
+    hides a 100% realistic cohort behind a degraded stress cohort."""
+    bd = _rips_source_breakdown(items)
+    rel = [(100.0 * c / n) for s, (c, n) in bd.items()
+           if s in ("real", "cohortA", "cohortB") and n]
+    if len(rel) < 2:
+        return None
+    return min(rel), max(rel)
+
+
 def _print_rips_label_sources(items: List[dict]) -> None:
     """Break Index-1 accuracy out by label source so each cohort — real disc
     labels, Cohort A (full title), Cohort B (initials) — is reported separately
@@ -883,12 +896,20 @@ def print_report(results: dict) -> None:
         r = rips[idx]
         t = r["total"]
         pattern = RIPS_PATTERNS.get(int(idx), "unknown pattern")
+        items = r.get("items", [])
         print(f"Sort_Rips Index {idx} ({pattern}):")
-        print(f"  title {r['title_correct']}/{t} ({pct(r['title_correct'], t)})  "
-              f"title+year {r['title_year_correct']}/{t}  wrong {r['wrong']}  miss {r['miss']}"
-              + (f"  unmapped {r['unmapped']}" if r['unmapped'] else ""))
-        _print_rips_label_sources(r.get("items", []))
-        _print_rips_failures(r.get("items", []))
+        rng = _rips_range(items)
+        if rng:
+            lo, hi = rng
+            print(f"  title {lo:.1f}%–{hi:.1f}% across hint cohorts  "
+                  f"(blended {r['title_correct']}/{t}, wrong {r['wrong']}, miss {r['miss']}"
+                  + (f", unmapped {r['unmapped']}" if r['unmapped'] else "") + ")")
+        else:
+            print(f"  title {r['title_correct']}/{t} ({pct(r['title_correct'], t)})  "
+                  f"title+year {r['title_year_correct']}/{t}  wrong {r['wrong']}  miss {r['miss']}"
+                  + (f"  unmapped {r['unmapped']}" if r['unmapped'] else ""))
+        _print_rips_label_sources(items)
+        _print_rips_failures(items)
     tv = results.get("tv", {})
     for idx in sorted(tv):
         r = tv[idx]
