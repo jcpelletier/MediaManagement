@@ -345,6 +345,83 @@ def transcribe_with_faster_whisper(model: "_WhisperModel", wav_path: Path) -> Op
     return text if text else None
 
 
+# ─── transcript cache ────────────────────────────────────────────────────────
+# Whisper transcription is the slow, repeated cost. We cache each clip's
+# transcript keyed by the file fingerprint (size + duration) AND the exact
+# transcription parameters (model + clip offset/length), so a cached transcript
+# is only ever reused under identical conditions — reuse is then functionally
+# identical to re-transcribing, just faster and deterministic. Changing the
+# model or clip window misses the cache and re-transcribes. Shared between the
+# sorter and the accuracy harness (which stage hardlinks with the same size +
+# duration as the real library file, so the key matches).
+
+def transcript_cache_path(
+    cache_dir: Path, size_bytes: int, duration_s: Optional[float],
+    model: str, start: float, seconds: float,
+) -> Path:
+    key = f"{size_bytes}_{int(round(duration_s or 0))}_{model}_{int(round(start))}_{int(round(seconds))}"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", key)
+    return cache_dir / f"{safe}.json"
+
+
+def load_cached_transcript(
+    cache_dir: Optional[Path], size_bytes: int, duration_s: Optional[float],
+    model: str, start: float, seconds: float,
+) -> Optional[str]:
+    if not cache_dir:
+        return None
+    p = transcript_cache_path(cache_dir, size_bytes, duration_s, model, start, seconds)
+    if not p.is_file():
+        return None
+    try:
+        text = json.loads(p.read_text(encoding="utf-8")).get("transcript")
+        return text or None
+    except Exception:
+        return None
+
+
+def save_cached_transcript(
+    cache_dir: Optional[Path], size_bytes: int, duration_s: Optional[float],
+    model: str, start: float, seconds: float, transcript: str,
+) -> None:
+    if not cache_dir or not transcript:
+        return
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        p = transcript_cache_path(cache_dir, size_bytes, duration_s, model, start, seconds)
+        p.write_text(json.dumps({
+            "transcript": transcript, "size_bytes": size_bytes,
+            "duration_s": duration_s, "whisper_model": model,
+            "clip_start": start, "clip_seconds": seconds,
+        }, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"  [CACHE] could not write transcript cache: {e}")
+
+
+def get_clip_transcript(
+    video_path: Path, size_bytes: int, duration_s: Optional[float],
+    start: float, seconds: float, whisper_model: Optional["_WhisperModel"],
+    model_name: str, cache_dir: Optional[Path],
+) -> Optional[str]:
+    """Transcript for one audio clip, served from the cache when present and
+    written back on a fresh transcription. Returns None if neither a cache entry
+    nor a usable Whisper model can produce one."""
+    cached = load_cached_transcript(cache_dir, size_bytes, duration_s, model_name, start, seconds)
+    if cached is not None:
+        print(f"  [CACHE] hit: {seconds:.0f}s @ {start:.0f}s ({model_name})")
+        return cached
+    if whisper_model is None:
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        wav_path = Path(td) / "clip.wav"
+        if not extract_audio_clip_wav(video_path, wav_path, start, seconds):
+            print(f"  [WHISPER] Audio extraction failed")
+            return None
+        transcript = transcribe_with_faster_whisper(whisper_model, wav_path)
+    save_cached_transcript(cache_dir, size_bytes, duration_s, model_name, start, seconds, transcript or "")
+    return transcript
+
+
 # ─── TMDB movie verification ─────────────────────────────────────────────────
 
 @dataclass
@@ -675,6 +752,8 @@ def process_folder(
     whisper_base_seconds: float = WHISPER_BASE_SECONDS_DEFAULT,
     tmdb_client: Optional[TmdbMovieClient] = None,
     tmdb_min_title_match: float = 0.78,
+    whisper_model_name: str = "base",
+    transcript_cache: Optional[Path] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Process one folder. Returns (moved_filename, skip_reason). Exactly one is non-None."""
     video_files = collect_video_files(folder, extensions)
@@ -715,7 +794,9 @@ def process_folder(
         return None, f"TMDB could not confirm '{guess.title}'"
 
     # ── always sample the audio transcript when there is no subtitle ──────────
-    if whisper_model is None:
+    # A warm transcript cache can serve the samples even without a loaded Whisper
+    # model, so only bail here when there is neither a model nor a cache to draw on.
+    if whisper_model is None and transcript_cache is None:
         if not subtitle_text:
             reason = "no subtitle and Whisper unavailable — cannot sample content to identify"
         else:
@@ -729,6 +810,7 @@ def process_folder(
         print(f"SKIP: {reason}")
         return None, reason
 
+    file_size = largest_file.stat().st_size
     audio_clips: List[str] = []
 
     for attempt in range(1, WHISPER_MAX_ATTEMPTS + 1):
@@ -742,21 +824,18 @@ def process_folder(
         actual_duration = min(duration, dur_s - start - 1.0)
         print(f"  [WHISPER] Attempt {attempt}/{WHISPER_MAX_ATTEMPTS}: {actual_duration:.0f}s @ {start:.0f}s")
 
-        with tempfile.TemporaryDirectory() as td:
-            wav_path = Path(td) / "clip.wav"
-            ok = extract_audio_clip_wav(largest_file, wav_path, start, actual_duration)
-            if not ok:
-                print(f"  [WHISPER] Audio extraction failed")
-            else:
-                transcript = transcribe_with_faster_whisper(whisper_model, wav_path)
-                if transcript:
-                    preview = transcript[:120] + ("..." if len(transcript) > 120 else "")
-                    print(f"  [WHISPER] Transcript: \"{preview}\"")
-                    audio_clips.append(
-                        f"AUDIO CLIP {attempt} ({actual_duration:.0f}s @ {start:.0f}s):\n{transcript}"
-                    )
-                else:
-                    print(f"  [WHISPER] Empty transcript")
+        transcript = get_clip_transcript(
+            largest_file, file_size, dur_s, start, actual_duration,
+            whisper_model, whisper_model_name, transcript_cache,
+        )
+        if transcript:
+            preview = transcript[:120] + ("..." if len(transcript) > 120 else "")
+            print(f"  [WHISPER] Transcript: \"{preview}\"")
+            audio_clips.append(
+                f"AUDIO CLIP {attempt} ({actual_duration:.0f}s @ {start:.0f}s):\n{transcript}"
+            )
+        else:
+            print(f"  [WHISPER] No transcript for this clip")
 
         # Build combined evidence: subtitles (if any) + all audio clips so far
         evidence_parts: List[str] = []
@@ -823,6 +902,10 @@ def parse_args() -> argparse.Namespace:
                    help=f"Interval between sample points in seconds (default: {WHISPER_INTERVAL_SECONDS_DEFAULT:.0f}). Samples at 1×, 2×, 3× this value (5, 10, 15 min).")
     w.add_argument("--whisper-base-seconds", type=float, default=WHISPER_BASE_SECONDS_DEFAULT,
                    help=f"Initial clip duration in seconds; doubles each retry (default: {WHISPER_BASE_SECONDS_DEFAULT:.0f})")
+    w.add_argument("--transcript-cache", type=Path, default=None,
+                   help="Directory of cached clip transcripts (keyed by file size+duration and "
+                        "the model/clip window). Reused when present, written on a fresh "
+                        "transcription. Lets repeat runs skip re-transcribing identical clips.")
 
     # TMDB
     t = parser.add_argument_group("TMDB verification")
@@ -956,6 +1039,8 @@ def main() -> None:
             whisper_base_seconds=args.whisper_base_seconds,
             tmdb_client=tmdb_client,
             tmdb_min_title_match=args.tmdb_min_title_match,
+            whisper_model_name=args.whisper_model,
+            transcript_cache=args.transcript_cache,
         )
         if moved:
             moved_movies.append(moved)
