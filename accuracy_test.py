@@ -81,22 +81,26 @@ VIDEO_EXTS = {e.lower() for e in DEFAULT_EXTENSIONS}
 # A correct identification can still differ from the library's folder name when
 # TMDB's canonical title carries a subtitle the library omits — e.g. the sorter
 # produces "The Water Horse: Legend of the Deep" but the library folder is "The
-# Water Horse". Same movie, fuller title. This separator-gated check accepts that
-# without accepting sequels ("Cars" vs "Cars 2") or franchise siblings
-# ("Bourne Ultimatum" vs "Bourne Identity") — it only matches when the shorter
-# title equals the *root* (text before a ': '/' - ' subtitle separator) of the
-# longer one.
-_SUBTITLE_SEP_RE = re.compile(r"\s*[:–—-]\s+")
+# Water Horse". Same movie, fuller title. We match on a token prefix (the sorter
+# sanitizes ':' to a space, so the separator is gone by the time we see the
+# folder name), with a sequel guard so this accepts the subtitle case WITHOUT
+# accepting sequels ("Cars" vs "Cars 2") or franchise siblings ("Bourne
+# Ultimatum" vs "Bourne Identity").
+_SEQUEL_TOKEN_RE = re.compile(r"^(?:\d+|i{1,3}|iv|vi{0,3}|ix|xi{0,3})$")
 
 
 def titles_same_movie(a: str, b: str) -> bool:
-    """True if one title is the other plus a colon/dash-introduced subtitle."""
-    na, nb = norm_title(a), norm_title(b)
-    if not na or not nb or na == nb:
+    """True when one title is the other plus a subtitle (same movie, fuller
+    title). The shorter title's tokens must be a leading prefix of the longer's,
+    and the first extra token must not be a sequel marker (a number / roman
+    numeral)."""
+    ta, tb = norm_title(a).split(), norm_title(b).split()
+    if not ta or not tb or ta == tb:
         return False
-    root_a = norm_title(_SUBTITLE_SEP_RE.split(a, 1)[0])
-    root_b = norm_title(_SUBTITLE_SEP_RE.split(b, 1)[0])
-    return na == root_b or nb == root_a
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if long_[:len(short)] != short:
+        return False
+    return not _SEQUEL_TOKEN_RE.match(long_[len(short)])
 
 # Human-readable labels for the obfuscation pattern each index applies. Kept in
 # sync with the staging functions (stage_movies / stage_tv) so the Jenkins log
