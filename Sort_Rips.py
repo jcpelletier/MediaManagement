@@ -324,11 +324,24 @@ def get_subtitle_evidence(folder: Path, video_file: Path, max_lines: int = 80) -
         if excerpt:
             print(f"  [SUBS ] Using .srt file: {srt.name}")
             return excerpt
-    # Embedded subtitle track
+    # Embedded text subtitle track
     excerpt = extract_embedded_subtitle_excerpt(video_file, max_lines)
     if excerpt:
         print(f"  [SUBS ] Using embedded subtitle track from: {video_file.name}")
-    return excerpt
+        return excerpt
+    # Bitmap subtitle track (PGS/VobSub) — OCR a sample to text. On any failure
+    # this returns None and the caller proceeds to the audio path; no Whisper is
+    # invoked from inside the OCR.
+    try:
+        from subtitle_ocr import ocr_subtitle_text
+        ocr_text = ocr_subtitle_text(video_file, max_lines=max_lines)
+    except Exception as exc:
+        print(f"  [SUBS ] Bitmap-subtitle OCR unavailable: {exc}")
+        ocr_text = None
+    if ocr_text:
+        print(f"  [SUBS ] OCR'd bitmap subtitle ({ocr_text.count(chr(10)) + 1} lines) from: {video_file.name}")
+        return ocr_text
+    return None
 
 
 # ─── audio / Whisper ─────────────────────────────────────────────────────────
