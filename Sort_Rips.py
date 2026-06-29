@@ -60,6 +60,31 @@ WHISPER_INTERVAL_SECONDS_DEFAULT = 300.0  # sample at 5, 10, 15 min (1×, 2×, 3
 WHISPER_BASE_SECONDS_DEFAULT     = 60.0   # initial clip duration; doubles each retry (60, 120, 240s)
 WHISPER_MAX_ATTEMPTS             = 3      # attempts at 5 min, 10 min, 15 min
 
+# Multi-clip audio sampling. A single clip at one fixed offset is often
+# unidentifiable (generic setup/narration); sampling several clips spread across
+# the runtime gives the LLM far more chance of catching identifying dialogue.
+# Offsets are fractions of the file duration (deterministic per file, so the
+# transcript cache keys stay stable across runs). The primary set is fed to the
+# LLM up front; the fallback set is added only when the first pass is unsure.
+WHISPER_CLIP_SECONDS            = 75.0
+WHISPER_CLIP_FRACTIONS_PRIMARY  = (0.20, 0.50, 0.80)
+WHISPER_CLIP_FRACTIONS_FALLBACK = (0.35, 0.65)
+WHISPER_CLIP_MIN_SECONDS        = 15.0   # skip a clip too close to the end to be useful
+
+
+def movie_clip_plan(duration_s: float, fractions: Iterable[float],
+                    clip_seconds: float = WHISPER_CLIP_SECONDS) -> List[Tuple[float, float]]:
+    """(start, seconds) clips at the given fractions of ``duration_s``. A clip is
+    trimmed (or dropped) when it would run past the end of the file. Deterministic
+    so the transcript cache keys are stable run to run."""
+    plan: List[Tuple[float, float]] = []
+    for frac in fractions:
+        start = round(duration_s * frac)
+        seconds = min(clip_seconds, duration_s - start - 1.0)
+        if seconds >= WHISPER_CLIP_MIN_SECONDS:
+            plan.append((float(start), float(seconds)))
+    return plan
+
 # Sentinel skip reason for folders that look like episodic TV discs. These are
 # intentionally left for Sort_TV.py to handle, so they are NOT reported as
 # "could not be identified" failures in the summary.
@@ -768,44 +793,39 @@ def process_folder(
     file_size = largest_file.stat().st_size
     audio_clips: List[str] = []
 
-    for attempt in range(1, WHISPER_MAX_ATTEMPTS + 1):
-        start = attempt * whisper_interval_seconds          # 5 min, 10 min, 15 min
-        duration = whisper_base_seconds * (2 ** (attempt - 1))  # 60s, 120s, 240s
-
-        if start + 1.0 >= dur_s:
-            print(f"  [WHISPER] Attempt {attempt} skipped: start {start:.0f}s >= file duration {dur_s:.0f}s")
-            break
-
-        actual_duration = min(duration, dur_s - start - 1.0)
-        print(f"  [WHISPER] Attempt {attempt}/{WHISPER_MAX_ATTEMPTS}: {actual_duration:.0f}s @ {start:.0f}s")
-
-        transcript = get_clip_transcript(
-            largest_file, file_size, dur_s, start, actual_duration,
-            whisper_model, whisper_model_name, transcript_cache,
-        )
-        if transcript:
-            preview = transcript[:120] + ("..." if len(transcript) > 120 else "")
-            print(f"  [WHISPER] Transcript: \"{preview}\"")
-            audio_clips.append(
-                f"AUDIO CLIP {attempt} ({actual_duration:.0f}s @ {start:.0f}s):\n{transcript}"
+    def gather_clips(fractions) -> None:
+        """Transcribe (cache-backed) the clips at ``fractions`` and append them."""
+        for start, seconds in movie_clip_plan(dur_s, fractions):
+            transcript = get_clip_transcript(
+                largest_file, file_size, dur_s, start, seconds,
+                whisper_model, whisper_model_name, transcript_cache,
             )
-        else:
-            print(f"  [WHISPER] No transcript for this clip")
+            if transcript:
+                preview = transcript[:120] + ("..." if len(transcript) > 120 else "")
+                print(f"  [WHISPER] clip {seconds:.0f}s @ {start:.0f}s: \"{preview}\"")
+                audio_clips.append(f"AUDIO CLIP ({seconds:.0f}s @ {start:.0f}s):\n{transcript}")
+            else:
+                print(f"  [WHISPER] no transcript for clip @ {start:.0f}s")
 
-        # Build combined evidence: subtitles (if any) + all audio clips so far
-        evidence_parts: List[str] = []
+    def identify_from_evidence() -> Optional[FolderGuess]:
+        parts: List[str] = []
         if subtitle_text:
-            evidence_parts.append(f"SUBTITLES:\n{subtitle_text}")
+            parts.append(f"SUBTITLES:\n{subtitle_text}")
         if audio_clips:
-            evidence_parts.append("\n\n".join(audio_clips))
-        combined_evidence = "\n\n".join(evidence_parts) or None
+            parts.append("\n\n".join(audio_clips))
+        return call_llm(llm_client, folder.name, files_summary,
+                        evidence_text="\n\n".join(parts) or None)
 
-        guess = call_llm(llm_client, folder.name, files_summary, evidence_text=combined_evidence)
+    guess = None
+    # Two tiers: a spread of clips up front, then more clips only if still unsure.
+    for tier, fractions in (("primary", WHISPER_CLIP_FRACTIONS_PRIMARY),
+                            ("fallback", WHISPER_CLIP_FRACTIONS_FALLBACK)):
+        gather_clips(fractions)
+        guess = identify_from_evidence()
         if not guess:
             break
-
-        print(f"  [LLM  ] Attempt {attempt}: '{guess.title}' ({guess.year}) conf={guess.confidence:.2f}")
-
+        print(f"  [LLM  ] {tier} ({len(audio_clips)} clip(s)): "
+              f"'{guess.title}' ({guess.year}) conf={guess.confidence:.2f}")
         # Only finalize once we actually have a content sample (subtitle or a
         # successful transcript) — never on the folder name alone.
         if guess.confidence >= min_confidence and (subtitle_text or audio_clips):
@@ -816,6 +836,8 @@ def process_folder(
 
     if not (subtitle_text or audio_clips):
         reason = "could not sample any content (no subtitle; audio unreadable) — not identifying on folder name alone"
+    elif guess is None:
+        reason = "LLM returned no guess after sampling content"
     else:
         reason = f"low confidence ({guess.confidence:.2f}) after sampling content"
     print(f"SKIP: {reason} for '{folder.name}'")
