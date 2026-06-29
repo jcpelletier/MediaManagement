@@ -410,7 +410,9 @@ def stage_movies(movies: List[MovieGT], dest_dir: Path, index: int, mode: str,
                  rng: random.Random, label_index: Optional["RealLabelIndex"] = None
                  ) -> Tuple[Dict[Tuple[int, int], MovieGT], str, Dict[Tuple[int, int], str]]:
     """Build one obfuscated source tree for Sort_Rips. Returns key->GT map, the
-    link mode used, and key->label-source ("real" | "synthetic" | "blind")."""
+    link mode used, and key->label-source ("real" | "cohortA" | "cohortB" |
+    "blind"). cohortA = full run-together title (realistic disc label);
+    cohortB = initials only (forces the audio-fallback path)."""
     keymap: Dict[Tuple[int, int], MovieGT] = {}
     label_sources: Dict[Tuple[int, int], str] = {}
     used_folders: set = set()
@@ -422,8 +424,15 @@ def stage_movies(movies: List[MovieGT], dest_dir: Path, index: int, mode: str,
             base = real_label
             label_sources[mv.key] = "real"
         elif index == 1:
-            base = squash_title(mv.title) if (i % 2 == 0) else acronym_label(mv.title)
-            label_sources[mv.key] = "synthetic"
+            # Two synthetic cohorts, alternating: A = full run-together title
+            # (realistic disc label, e.g. THEGOONIES); B = initials only
+            # (e.g. TGMOVIE), which forces the audio-fallback path.
+            if i % 2 == 0:
+                base = squash_title(mv.title)
+                label_sources[mv.key] = "cohortA"
+            else:
+                base = acronym_label(mv.title)
+                label_sources[mv.key] = "cohortB"
         else:
             base = f"MOVIEFOLDER_{i + 1:03d}"
             label_sources[mv.key] = "blind"
@@ -724,14 +733,24 @@ def _rips_source_breakdown(items: List[dict]) -> Dict[str, Tuple[int, int]]:
     return {s: (c, n) for s, (c, n) in by_src.items()}
 
 
+_LABEL_SOURCE_NAMES = {
+    "real": "real disc label",
+    "cohortA": "Cohort A (full title)",
+    "cohortB": "Cohort B (initials)",
+    "blind": "blind",
+    "?": "unknown",
+}
+
+
 def _print_rips_label_sources(items: List[dict]) -> None:
-    """When real disc labels were used, break the accuracy out by source so the
-    realistic ('real') number is visible next to the synthetic stand-ins."""
+    """Break Index-1 accuracy out by label source so each cohort — real disc
+    labels, Cohort A (full title), Cohort B (initials) — is reported separately
+    instead of being averaged into one misleading number."""
     breakdown = _rips_source_breakdown(items)
-    if "real" not in breakdown:
+    if not ({"real", "cohortA", "cohortB"} & set(breakdown)):
         return
-    order = ["real", "synthetic", "blind", "?"]
-    parts = [f"{s}: {c}/{n} ({pct(c, n)})"
+    order = ["real", "cohortA", "cohortB", "blind", "?"]
+    parts = [f"{_LABEL_SOURCE_NAMES.get(s, s)}: {c}/{n} ({pct(c, n)})"
              for s in order if s in breakdown
              for (c, n) in [breakdown[s]]]
     print("  by label source -> " + "   ".join(parts))
@@ -756,7 +775,8 @@ def _print_rips_failures(items: List[dict]) -> None:
         print(f"  {label}:")
         for row in rows:
             got = row.get("identified") or "(no folder)"
-            tag = {"real": " [real-label]", "synthetic": " [synthetic]"}.get(row.get("label_source"), "")
+            tag = {"real": " [real-label]", "cohortA": " [cohort A]",
+                   "cohortB": " [cohort B]"}.get(row.get("label_source"), "")
             print(f"    - {_fmt_movie_gt(row)}{tag}  ->  got: {got}")
 
 
