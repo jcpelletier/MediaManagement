@@ -518,7 +518,8 @@ def run_sort_rips(source: Path, dest: Path, processed: Path, no_audio: bool,
 
 
 def run_sort_tv(root: Path, dest: Path, no_audio: bool, summary_json: Path,
-                whisper_model: Optional[str], log_path: Path, env: Optional[dict]) -> int:
+                whisper_model: Optional[str], log_path: Path, env: Optional[dict],
+                transcript_cache: Optional[Path] = None) -> int:
     cmd = [
         sys.executable, str(SCRIPT_DIR / "Sort_TV.py"),
         "--root", str(root),
@@ -527,6 +528,8 @@ def run_sort_tv(root: Path, dest: Path, no_audio: bool, summary_json: Path,
     ]
     if whisper_model:
         cmd += ["--whisper-model", whisper_model]
+    if transcript_cache:
+        cmd += ["--transcript-cache", str(transcript_cache)]
     if no_audio:
         cmd.append("--no-audio-fallback")
     return run_subprocess(cmd, log_path, env)
@@ -616,7 +619,8 @@ def job_tv(idx: int, sampled: List[Season], run_dir: Path, args, eps_per_disc: i
     rng = random.Random(args.seed + 200 + idx)
     keymap, mode = stage_tv(sampled, src, idx, eps_per_disc, args.link_mode, rng)
     rc = run_sort_tv(src, out, args.no_audio_fallback, summ,
-                     args.whisper_model, log, child_env(threads))
+                     args.whisper_model, log, child_env(threads),
+                     transcript_cache=getattr(args, "transcript_cache", None))
     return {"script": "tv", "idx": str(idx), "result": score_tv(keymap, out, [src]),
             "log": log, "mode": mode, "n": len(keymap), "rc": rc}
 
