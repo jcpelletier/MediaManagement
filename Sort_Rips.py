@@ -66,9 +66,9 @@ WHISPER_MAX_ATTEMPTS             = 3      # attempts at 5 min, 10 min, 15 min
 # Offsets are fractions of the file duration (deterministic per file, so the
 # transcript cache keys stay stable across runs). The primary set is fed to the
 # LLM up front; the fallback set is added only when the first pass is unsure.
-WHISPER_CLIP_SECONDS            = 75.0
-WHISPER_CLIP_FRACTIONS_PRIMARY  = (0.20, 0.50, 0.80)
-WHISPER_CLIP_FRACTIONS_FALLBACK = (0.35, 0.65)
+WHISPER_CLIP_SECONDS            = 90.0
+WHISPER_CLIP_FRACTIONS_PRIMARY  = (0.15, 0.40, 0.62, 0.85)
+WHISPER_CLIP_FRACTIONS_FALLBACK = (0.28, 0.72)
 WHISPER_CLIP_MIN_SECONDS        = 15.0   # skip a clip too close to the end to be useful
 
 
