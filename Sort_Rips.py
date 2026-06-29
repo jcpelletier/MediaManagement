@@ -2,11 +2,16 @@
 """
 Sort ripped movie folders by asking an LLM to guess the movie title.
 
-Evidence tiers (cheapest/fastest first):
-1. Folder name + video filenames/sizes  -> Claude first pass
-2. + subtitle text (.srt in folder or embedded subtitle track)
-3. + local Whisper audio transcription (up to 3 attempts, doubling duration each retry,
-     starting at --whisper-start-seconds into the file)
+Identification is content-grounded: the folder name is only a hint, and a movie
+is never identified from the folder name (plus filenames) alone. Every decision
+is backed by a sample of the actual content — a subtitle excerpt, or an audio
+transcript when no subtitle exists.
+
+Evidence (folder name is a hint throughout; content is mandatory):
+1. Folder name + video filenames/sizes  -> LLM hint only (cannot finalize alone)
+2. + subtitle text (.srt in folder or embedded subtitle track) -> content sample
+3. + local Whisper audio transcription when there is no usable subtitle (up to 3
+     attempts, doubling duration each retry) -> content sample
 4. TMDB verification to confirm/correct title and year
 
 Requires:
@@ -685,27 +690,37 @@ def process_folder(
     extra_files = [f for f in video_files if f != largest_file]
     files_summary = format_files_for_prompt(video_files)
 
-    # ── tier 1 + 2: folder/file metadata + subtitles ─────────────────────────
+    # ── content-grounded identification ───────────────────────────────────────
+    # The folder name is only a hint; a movie is never identified from it (plus
+    # filenames) alone. Identification must always be grounded in a sample of the
+    # actual content: a usable subtitle excerpt, or — when none exists — a Whisper
+    # audio transcript. This stops a confident-but-wrong folder name (e.g. an
+    # ambiguous disc label) from short-circuiting to a bad rename.
     subtitle_text = get_subtitle_evidence(folder, largest_file, srt_max_lines)
-    initial_evidence = subtitle_text  # may be None
 
-    guess = call_llm(llm_client, folder.name, files_summary, evidence_text=initial_evidence)
+    guess = call_llm(llm_client, folder.name, files_summary, evidence_text=subtitle_text)
     if not guess:
         return None, "LLM call failed"
 
     src = "subtitles" if subtitle_text else "filenames only"
     print(f"  [LLM  ] First pass ({src}): '{guess.title}' ({guess.year}) conf={guess.confidence:.2f}")
 
-    if guess.confidence >= min_confidence:
+    # A usable subtitle excerpt already is the content sample, so a confident
+    # subtitle-backed guess may finalize. Without a subtitle we must sample audio
+    # before committing — never finalize on the folder name alone.
+    if subtitle_text and guess.confidence >= min_confidence:
         result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match, extra_files=extra_files)
         if result:
             return result, None
         return None, f"TMDB could not confirm '{guess.title}'"
 
-    # ── tier 3: local Whisper audio fallback ─────────────────────────────────
+    # ── always sample the audio transcript when there is no subtitle ──────────
     if whisper_model is None:
-        reason = f"low confidence ({guess.confidence:.2f}) and Whisper not available"
-        print(f"SKIP: Low confidence ({guess.confidence:.2f}) and Whisper not available")
+        if not subtitle_text:
+            reason = "no subtitle and Whisper unavailable — cannot sample content to identify"
+        else:
+            reason = f"low confidence ({guess.confidence:.2f}) and Whisper not available"
+        print(f"SKIP: {reason}")
         return None, reason
 
     dur_s = ffprobe_duration_seconds(largest_file)
@@ -757,13 +772,18 @@ def process_folder(
 
         print(f"  [LLM  ] Attempt {attempt}: '{guess.title}' ({guess.year}) conf={guess.confidence:.2f}")
 
-        if guess.confidence >= min_confidence:
+        # Only finalize once we actually have a content sample (subtitle or a
+        # successful transcript) — never on the folder name alone.
+        if guess.confidence >= min_confidence and (subtitle_text or audio_clips):
             result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match, extra_files=extra_files)
             if result:
                 return result, None
             return None, f"TMDB could not confirm '{guess.title}'"
 
-    reason = f"low confidence ({guess.confidence:.2f}) after all Whisper attempts"
+    if not (subtitle_text or audio_clips):
+        reason = "could not sample any content (no subtitle; audio unreadable) — not identifying on folder name alone"
+    else:
+        reason = f"low confidence ({guess.confidence:.2f}) after sampling content"
     print(f"SKIP: {reason} for '{folder.name}'")
     return None, reason
 
