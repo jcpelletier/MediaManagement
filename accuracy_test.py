@@ -564,17 +564,17 @@ def fill_transcript_cache(movies: List[MovieGT], cache_dir: Optional[Path],
         print("[CACHE] Sort_Rips unavailable; skipping transcript-cache fill.")
         return
 
-    start = SR.WHISPER_INTERVAL_SECONDS_DEFAULT       # first clip: 5 min in
-    base = SR.WHISPER_BASE_SECONDS_DEFAULT            # 60s
+    # Warm the same primary clips Sort_Rips samples (20/50/80% of duration), so a
+    # subsequent run is fully cache-served. Mirrors movie_clip_plan exactly.
     todo = []
     for mv in movies:
         dur = SR.ffprobe_duration_seconds(mv.real_path)
-        if dur is None or start + 1.0 >= dur:
-            continue  # Sort_Rips would not take a first clip here either
-        seconds = min(base, dur - start - 1.0)
+        if dur is None:
+            continue
         size = mv.real_path.stat().st_size
-        if SR.load_cached_transcript(cache_dir, size, dur, model_name, start, seconds) is None:
-            todo.append((mv, size, dur, seconds))
+        for start, seconds in SR.movie_clip_plan(dur, SR.WHISPER_CLIP_FRACTIONS_PRIMARY):
+            if SR.load_cached_transcript(cache_dir, size, dur, model_name, start, seconds) is None:
+                todo.append((mv.real_path, size, dur, start, seconds))
 
     if not todo:
         print(f"[CACHE] transcript cache already complete for {len(movies)} sampled movie(s).")
@@ -583,9 +583,9 @@ def fill_transcript_cache(movies: List[MovieGT], cache_dir: Optional[Path],
     if model is None:
         print(f"[CACHE] {len(todo)} transcript(s) missing but no Whisper model loaded; skipping fill.")
         return
-    print(f"[CACHE] filling {len(todo)} missing transcript(s) with model '{model_name}'...")
-    for mv, size, dur, seconds in todo:
-        SR.get_clip_transcript(mv.real_path, size, dur, start, seconds, model, model_name, cache_dir)
+    print(f"[CACHE] filling {len(todo)} missing clip transcript(s) with model '{model_name}'...")
+    for path, size, dur, start, seconds in todo:
+        SR.get_clip_transcript(path, size, dur, start, seconds, model, model_name, cache_dir)
     print("[CACHE] transcript-cache fill done.")
 
 
