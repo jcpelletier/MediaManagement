@@ -347,6 +347,26 @@ class TmdbMovie:
     movie_id: int
     title: str
     year: Optional[int]
+    original_title: Optional[str] = None
+
+
+def best_title_match(guess_title: str, candidates: Iterable[str]) -> Tuple[Optional[str], float]:
+    """Return the candidate most similar to ``guess_title`` and its (normalized)
+    score. ``similarity`` strips diacritics/punctuation, so several variants of a
+    title can tie at the same score; a raw-string ratio breaks ties toward the
+    candidate that matches the guess most literally (keeping 'Nausicaä …' over a
+    'Nausica …' misspelling that normalizes identically)."""
+    best: Optional[str] = None
+    best_key: Tuple[float, float] = (0.0, 0.0)
+    g = guess_title.lower()
+    for cand in candidates:
+        if not cand:
+            continue
+        key = (similarity(guess_title, cand),
+               SequenceMatcher(None, g, cand.lower()).ratio())
+        if key > best_key:
+            best, best_key = cand, key
+    return best, best_key[0]
 
 
 class TmdbMovieClient:
@@ -387,7 +407,25 @@ class TmdbMovieClient:
                 pass
         if not movie_id or not canon_title:
             return None
-        return TmdbMovie(movie_id=int(movie_id), title=str(canon_title), year=release_year)
+        original_title = top.get("original_title") or None
+        return TmdbMovie(movie_id=int(movie_id), title=str(canon_title),
+                         year=release_year, original_title=original_title)
+
+    def alternative_titles(self, movie_id: int) -> List[str]:
+        """All registered alternative titles for a movie (any region). Used to
+        rescue films whose TMDB primary title is a regional/era variant that
+        does not match a correct guess (e.g. Nausicaä -> 'Warriors of the Wind')."""
+        try:
+            data = self._get(f"/movie/{movie_id}/alternative_titles", {})
+        except Exception as e:
+            print(f"  [TMDB ] Alt-titles lookup failed: {e}")
+            return []
+        out: List[str] = []
+        for t in (data.get("titles") or []):
+            title = (t.get("title") or "").strip()
+            if title:
+                out.append(title)
+        return out
 
 
 def verify_movie_with_tmdb(
@@ -395,7 +433,14 @@ def verify_movie_with_tmdb(
     guess: FolderGuess,
     min_match: float,
 ) -> Optional[FolderGuess]:
-    """Return a (possibly corrected) FolderGuess if TMDB confirms, else None."""
+    """Return a (possibly corrected) FolderGuess if TMDB confirms, else None.
+
+    The guess is accepted if it matches the result's primary title, its original
+    title, or — only when those fall short — any of the movie's registered
+    alternative titles. The output keeps whichever known title best matches the
+    guess, so normal cases canonicalize to TMDB's title while a correct guess is
+    preserved when TMDB's primary title is a regional variant.
+    """
     result = tmdb.search_movie(guess.title, guess.year)
     if result is None:
         result = tmdb.search_movie(guess.title)  # retry without year constraint
@@ -403,27 +448,42 @@ def verify_movie_with_tmdb(
         print(f"  [TMDB ] No results for '{guess.title}'")
         return None
 
-    score = similarity(guess.title, result.title)
+    primary_candidates = [result.title, result.original_title or ""]
+    best_title, score = best_title_match(guess.title, primary_candidates)
+
     if score < min_match:
+        # Fall back to the full alternative-title set before giving up.
+        alt_title, alt_score = best_title_match(
+            guess.title, tmdb.alternative_titles(result.movie_id)
+        )
+        if alt_score > score:
+            best_title, score = alt_title, alt_score
+            if score >= min_match:
+                print(
+                    f"  [TMDB ] Matched via alternative title: '{guess.title}' "
+                    f"~ '{best_title}' (score={score:.2f})"
+                )
+
+    if score < min_match or not best_title:
         print(
             f"  [TMDB ] Title mismatch: '{guess.title}' vs '{result.title}' "
-            f"(score={score:.2f} < {min_match:.2f})"
+            f"(best score={score:.2f} < {min_match:.2f})"
         )
         return None
 
     corrected = (
-        norm_title(guess.title) != norm_title(result.title)
+        norm_title(guess.title) != norm_title(best_title)
         or guess.year != result.year
     )
     if corrected:
         print(
             f"  [TMDB ] Corrected: '{guess.title}' ({guess.year}) "
-            f"-> '{result.title}' ({result.year})"
+            f"-> '{best_title}' ({result.year})"
         )
     else:
-        print(f"  [TMDB ] Confirmed: '{result.title}' ({result.year}) (score={score:.2f})")
+        print(f"  [TMDB ] Confirmed: '{best_title}' ({result.year}) (score={score:.2f})")
 
-    return FolderGuess(title=result.title, year=result.year, confidence=guess.confidence)
+    return FolderGuess(title=best_title, year=result.year, confidence=guess.confidence)
 
 
 # ─── Claude ──────────────────────────────────────────────────────────────────
