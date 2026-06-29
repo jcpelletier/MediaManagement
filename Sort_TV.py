@@ -46,6 +46,8 @@ except ImportError:
     _FASTER_WHISPER_AVAILABLE = False
 from pydantic import BaseModel
 
+from transcript_cache import load_cached_transcript, save_cached_transcript
+
 from llm_deepseek import DeepSeekClient, DeepSeekError, DeepSeekAuthError
 
 
@@ -1640,6 +1642,10 @@ def main(argv=None):
                     help="faster-whisper model size (default: small). Options: tiny, base, small, medium, large-v3.")
     ap.add_argument("--whisper-device", default="cpu",
                     help="Device for faster-whisper (default: cpu). Use 'cuda' if GPU is available.")
+    ap.add_argument("--transcript-cache", type=Path, default=None,
+                    help="Directory of cached clip transcripts (shared with Sort_Rips; keyed by "
+                         "file size+duration and the model/clip window). Reused when present, "
+                         "written on a fresh transcription, so repeat runs skip re-transcribing.")
 
     # OpenSubtitles knowledge boost
     ap.add_argument("--opensubtitles-exact-rename", action="store_true",
@@ -2340,6 +2346,19 @@ def main(argv=None):
             return min(requested_start, latest_start)
 
         def attempt_audio_transcribe(seconds: float, stage: str, start_seconds: float) -> Tuple[Optional[str], Optional[float]]:
+            # Transcript cache: key by the BASE start (not the jittered one) so a
+            # re-run reuses the transcript regardless of per-run start jitter.
+            cache_dir = getattr(args, "transcript_cache", None)
+            model_name = args.whisper_model
+            try:
+                cache_size = mkv.stat().st_size
+            except OSError:
+                cache_size = 0
+            cached = load_cached_transcript(cache_dir, cache_size, dur_s, model_name, start_seconds, seconds)
+            if cached is not None:
+                if verbose:
+                    print(f"[CACHE] {stage} transcript hit ({seconds:.0f}s @ ~{start_seconds:.0f}s, {model_name})")
+                return cached, start_seconds
             jitter = random.uniform(AUDIO_START_JITTER_MIN, AUDIO_START_JITTER_MAX)
             jittered_start = start_seconds + jitter
             actual_start = clamp_clip_start(jittered_start, seconds)
@@ -2374,6 +2393,7 @@ def main(argv=None):
                     return None, None
                 if verbose:
                     print(f"[ASR  ] {stage} transcript: \"{one_line(tx)}\"")
+                save_cached_transcript(cache_dir, cache_size, dur_s, model_name, start_seconds, seconds, tx)
                 return tx, actual_start
 
         audio_transcript_primary = None

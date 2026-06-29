@@ -39,6 +39,9 @@ import requests
 from pydantic import BaseModel
 
 from llm_deepseek import DeepSeekClient, DeepSeekError, DeepSeekAuthError
+from transcript_cache import (
+    load_cached_transcript, save_cached_transcript, transcript_cache_path,
+)
 
 try:
     from faster_whisper import WhisperModel as _WhisperModel
@@ -346,57 +349,9 @@ def transcribe_with_faster_whisper(model: "_WhisperModel", wav_path: Path) -> Op
 
 
 # ─── transcript cache ────────────────────────────────────────────────────────
-# Whisper transcription is the slow, repeated cost. We cache each clip's
-# transcript keyed by the file fingerprint (size + duration) AND the exact
-# transcription parameters (model + clip offset/length), so a cached transcript
-# is only ever reused under identical conditions — reuse is then functionally
-# identical to re-transcribing, just faster and deterministic. Changing the
-# model or clip window misses the cache and re-transcribes. Shared between the
-# sorter and the accuracy harness (which stage hardlinks with the same size +
-# duration as the real library file, so the key matches).
-
-def transcript_cache_path(
-    cache_dir: Path, size_bytes: int, duration_s: Optional[float],
-    model: str, start: float, seconds: float,
-) -> Path:
-    key = f"{size_bytes}_{int(round(duration_s or 0))}_{model}_{int(round(start))}_{int(round(seconds))}"
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", key)
-    return cache_dir / f"{safe}.json"
-
-
-def load_cached_transcript(
-    cache_dir: Optional[Path], size_bytes: int, duration_s: Optional[float],
-    model: str, start: float, seconds: float,
-) -> Optional[str]:
-    if not cache_dir:
-        return None
-    p = transcript_cache_path(cache_dir, size_bytes, duration_s, model, start, seconds)
-    if not p.is_file():
-        return None
-    try:
-        text = json.loads(p.read_text(encoding="utf-8")).get("transcript")
-        return text or None
-    except Exception:
-        return None
-
-
-def save_cached_transcript(
-    cache_dir: Optional[Path], size_bytes: int, duration_s: Optional[float],
-    model: str, start: float, seconds: float, transcript: str,
-) -> None:
-    if not cache_dir or not transcript:
-        return
-    try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        p = transcript_cache_path(cache_dir, size_bytes, duration_s, model, start, seconds)
-        p.write_text(json.dumps({
-            "transcript": transcript, "size_bytes": size_bytes,
-            "duration_s": duration_s, "whisper_model": model,
-            "clip_start": start, "clip_seconds": seconds,
-        }, indent=2), encoding="utf-8")
-    except Exception as e:
-        print(f"  [CACHE] could not write transcript cache: {e}")
-
+# The cache key/format lives in transcript_cache.py so Sort_Rips and Sort_TV
+# share one cache directory. get_clip_transcript wraps it with this sorter's own
+# audio extraction + Whisper call.
 
 def get_clip_transcript(
     video_path: Path, size_bytes: int, duration_s: Optional[float],
