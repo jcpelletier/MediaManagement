@@ -634,9 +634,17 @@ def extract_subtitle_full(
 
     Returns None when subtitles are unavailable / bitmap-only / parse-fails."""
     txt = _srt_text_from_mkv(mkv_path)
-    if not txt:
+    if txt:
+        return parse_full_dialogue(txt, max_chars=max_chars, skip_head_seconds=skip_head_seconds)
+    # No text subtitle track: OCR a bitmap (PGS/VobSub) track to a dialogue block.
+    # OCR-or-None; the caller's audio/Whisper path handles None — no Whisper here.
+    # The OCR sample windows fall mid-episode (post-intro), so they give plot
+    # beats to disambiguate the episode against the TMDB synopsis list.
+    try:
+        from subtitle_ocr import ocr_subtitle_text
+        return ocr_subtitle_text(mkv_path, max_lines=200)
+    except Exception:
         return None
-    return parse_full_dialogue(txt, max_chars=max_chars, skip_head_seconds=skip_head_seconds)
 
 
 # ----------------------------
