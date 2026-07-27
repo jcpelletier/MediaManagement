@@ -8,7 +8,7 @@ Scripts for ripping, sorting, and converting media on **panda** (Ubuntu Server 2
 |---|---|
 | `DEEPSEEK_API_KEY` | Sort_Rips.py, Sort_TV.py |
 | `DEEPSEEK_BASE_URL` | Sort_Rips.py, Sort_TV.py (optional; default `https://api.deepseek.com`) |
-| `DEEPSEEK_MODEL` | Sort_Rips.py, Sort_TV.py (optional; default `deepseek-chat`) |
+| `DEEPSEEK_MODEL` | Sort_Rips.py, Sort_TV.py (optional; default `deepseek-v4-flash`) |
 | `TMDB_API_KEY` | Sort_Rips.py, Sort_TV.py |
 | `OPENSUB_API_KEY` | Sort_TV.py (optional) |
 
@@ -155,8 +155,8 @@ python Sort_TV.py --root /mnt/media/Video/Processed [flags]
 | Flag | Default | Description |
 |---|---|---|
 | `--root` | *(required)* | Folder to scan recursively for `.mkv` files |
-| `--model` | `deepseek-chat` | Model for guided identification (show/season known) |
-| `--blind-model` | `deepseek-chat` | Model for blind identification (no folder hint) |
+| `--model` | `deepseek-v4-flash` | Model for guided identification (show/season known) |
+| `--blind-model` | `deepseek-v4-flash` | Model for blind identification (no folder hint) |
 | `--min-minutes` | `6.0` | Skip files shorter than this (low enough for short-form kids' episodes) |
 | `--max-minutes` | `100.0` | Skip files longer than this (allows 2-part episodes) |
 | `--min-confidence` | `0.85` | Minimum LLM confidence to rename |

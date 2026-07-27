@@ -1629,8 +1629,8 @@ def main(argv=None):
     ap.add_argument("--dest", default=None,
                     help="Library root to move identified episodes into (e.g. /mnt/media/Media/Shows). "
                          "Creates <Show>/Season NN/ subdirs as needed. Omit to rename files in place.")
-    ap.add_argument("--model", default="deepseek-chat", help="DeepSeek model for episode identification when folder/season is known (default: deepseek-chat)")
-    ap.add_argument("--blind-model", default="deepseek-chat", help="DeepSeek model for blind identification (no folder hint; default: deepseek-chat)")
+    ap.add_argument("--model", default="deepseek-v4-flash", help="DeepSeek model for episode identification when folder/season is known (default: deepseek-v4-flash)")
+    ap.add_argument("--blind-model", default="deepseek-v4-flash", help="DeepSeek model for blind identification (no folder hint; default: deepseek-v4-flash)")
     ap.add_argument("--min-minutes", type=float, default=6.0, help="Skip files shorter than this (default: 6). Low enough to keep short-form kids' episodes, e.g. Bluey (~7 min, often just under).")
     ap.add_argument("--max-minutes", type=float, default=100.0, help="Skip files longer than this (default: 100)")
     ap.add_argument("--min-confidence", type=float, default=0.85, help="Only consider LLM result when confidence >= this (default: 0.85)")

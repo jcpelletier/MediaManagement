@@ -19,7 +19,7 @@ import requests
 from pydantic import BaseModel, ValidationError
 
 DEFAULT_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
 T = TypeVar("T", bound=BaseModel)
 
