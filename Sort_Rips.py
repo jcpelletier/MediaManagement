@@ -1036,7 +1036,8 @@ def main() -> None:
             moved_movies.append(moved)
         elif reason and reason not in ("no video files", TV_DISC_DEFER_REASON):
             skipped_folders.append({"folder": folder.name, "reason": reason})
-        move_folder_to_processed(folder, processed_root, args.dry_run)
+        if moved or reason in ("no video files", TV_DISC_DEFER_REASON):
+            move_folder_to_processed(folder, processed_root, args.dry_run)
 
     if args.summary_json:
         summary = {
