@@ -86,6 +86,29 @@ def sanitize_filename(s: str) -> str:
     return s.strip(" .")
 
 
+def resolve_show_dir_name(dest_root: Optional[Path], show_s: str) -> str:
+    """Return the show folder name to use under dest_root.
+
+    If dest_root already has a show folder whose name matches show_s ignoring
+    case (e.g. "OUTLANDER" vs "Outlander"), reuse that folder's exact name so a
+    show never ends up split across two folders that differ only by case. The
+    library lives on NTFS via ntfs-3g, which is case-sensitive on Linux but
+    shows both folders confusingly to Windows/SMB clients and Jellyfin.
+    An exact-case match wins; otherwise the alphabetically first match is used.
+    """
+    if dest_root is None or not show_s:
+        return show_s
+    key = show_s.casefold()
+    try:
+        matches = sorted(p.name for p in dest_root.iterdir()
+                         if p.is_dir() and p.name.casefold() == key)
+    except OSError:
+        return show_s
+    if not matches or show_s in matches:
+        return show_s
+    return matches[0]
+
+
 def run_cmd(cmd: list[str]) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, capture_output=True, text=True)
     return p.returncode, p.stdout, p.stderr
@@ -1575,7 +1598,7 @@ def rename_and_move(
     dry_run: bool,
     dest_root: Optional[Path] = None,
 ) -> bool:
-    show_s = sanitize_filename(show)
+    show_s = resolve_show_dir_name(dest_root, sanitize_filename(show))
     title_s = sanitize_filename(title)
     new_name = f"{show_s} - S{season:02d}E{ep:02d} - {title_s}{src.suffix}"
 
@@ -3286,7 +3309,7 @@ def main(argv=None):
             by_season[(show_name, season_num)].append(mkv_path)
 
         for (show_name, season_num), paths in by_season.items():
-            show_s = sanitize_filename(show_name)
+            show_s = resolve_show_dir_name(dest_root, sanitize_filename(show_name))
             extras_dir = dest_root / show_s / f"Season {season_num:02d}" / "Extras"
 
             if args.dry_run:
