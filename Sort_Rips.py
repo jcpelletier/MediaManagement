@@ -649,8 +649,8 @@ def verify_movie_with_tmdb(
     # The movie hit is a different year than the guess.
     if guess.confidence >= CONFIDENT_GUESS_THRESHOLD:
         print(
-            f"  [TMDB ] Confident guess '{guess.title}' ({guess.year}) "
-            f"conf={guess.confidence:.2f}, not accepting '{result.title}' ({result.year})"
+            f"  [TMDB ] Rejected cross-type correction: {guess.title} ({guess.year}) "
+            f"conf={guess.confidence:.2f}, not accepting {result.title} ({result.year})"
         )
         # Never file a confident guess under a different-year movie; the TV
         # index might explain it (a series that shares the movie's name).

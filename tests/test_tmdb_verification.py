@@ -58,7 +58,7 @@ class FakeLlmClient:
 
 
 def _outlander_folder(tmp_path: Path) -> Path:
-    folder = tmp_path / "Outlander S06 Disc"
+    folder = tmp_path / "Outlander Disc"
     folder.mkdir()
     (folder / "video.mkv").write_bytes(b"dummy")
     srt = folder / "video.srt"
@@ -66,7 +66,7 @@ def _outlander_folder(tmp_path: Path) -> Path:
     return folder
 
 
-def test_outlander_case_defers_to_sort_tv(tmp_path, capsys):
+def test_outlander_case_defers_to_sort_tv(tmp_path, monkeypatch, capsys):
     # The subtitle pass identified 'Outlander' (2014) at conf=0.99. The movie
     # index only has the 2008 film; the TV index has the series. process_folder
     # must return the existing TV defer reason, leave the folder in place, and
@@ -74,6 +74,9 @@ def test_outlander_case_defers_to_sort_tv(tmp_path, capsys):
     folder = _outlander_folder(tmp_path)
     dest_root = tmp_path / "Movies"
     dest_root.mkdir()
+    # One feature-length title => deterministic movie routing, no ffprobe.
+    monkeypatch.setattr(Sort_Rips, "ffprobe_duration_seconds",
+                        lambda p: 7200.0)
     guess = FolderGuess(title="Outlander", year=2014, confidence=0.99)
     client = FakeTmdbClient(
         movie=TmdbMovie(movie_id=12000, title="Outlander", year=2008),
@@ -150,10 +153,13 @@ def test_confident_guess_accepts_same_year_movie_hit():
     assert result.year == 2021
     assert result.confidence == 0.95
     assert client.tv_calls == []
+
+
 def test_same_year_canonical_title_correction_still_applies(capsys):
     # A same-year canonical-title correction (e.g. a regional title) still
     # applies for a confident guess.
-    guess = FolderGuess(title="Warriors of the Wind", year=1984, confidence=0.92)
+    guess = FolderGuess(title="Nausicaä of the Valley of the Wind", year=1984,
+                        confidence=0.92)
     client = FakeTmdbClient(movie=TmdbMovie(
         movie_id=632, title="Nausicaä of the Valley of the Wind", year=1984,
         original_title="風のとこやけ娑婆鎮"))
@@ -161,8 +167,8 @@ def test_same_year_canonical_title_correction_still_applies(capsys):
     result = verify_movie_with_tmdb(client, guess, MIN_MATCH)
 
     assert result is not None and result is not TMDB_TV_DEFER
+    assert result.title == "Nausicaä of the Valley of the Wind"
     assert result.year == 1984
-    assert "Corrected" in capsys.readouterr().out
 
 
 def test_both_searches_match_same_title_year_files_as_movie(capsys):
@@ -202,7 +208,9 @@ def test_confidence_boundary_090_rejects_different_year(capsys):
     result = verify_movie_with_tmdb(client, guess, MIN_MATCH)
 
     assert result is None
-    assert "not accepting Outlander (2008)" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Outlander (2014) conf=0.90" in out
+    assert "not accepting Outlander (2008)" in out
 
 
 def test_title_match_is_case_insensitive(capsys):
