@@ -299,3 +299,12 @@ bash "$WORKSPACE/accuracy-test-notify.sh" \
   "$JOB_NAME" "$BUILD_RESULT" "$BUILD_NUMBER" "$BUILD_URL" \
   /tmp/accuracy_test_summary.json
 ```
+
+## Running the unit tests
+
+The `tests/` suite (run by GitHub Actions on every pull request and push to
+`main`) needs no media library, network access, or API keys. To run it locally:
+
+```bash
+pip install -r tests/requirements.txt && pytest
+```
