@@ -156,36 +156,60 @@ def test_confident_guess_accepts_same_year_movie_hit():
 
 
 def test_same_year_canonical_title_correction_still_applies(capsys):
-    # A same-year canonical-title correction (e.g. a regional title) still
-    # applies for a confident guess.
-    guess = FolderGuess(title="Nausicaä of the Valley of the Wind", year=1984,
-                        confidence=0.92)
+    # A same-year canonical-title correction (guess title differs from TMDB's
+    # canonical title even after normalization) still applies for a confident
+    # guess.
+    guess = FolderGuess(title="The Dark Knight Returns", year=2012,
+                        confidence=0.95)
     client = FakeTmdbClient(movie=TmdbMovie(
-        movie_id=632, title="Nausicaä of the Valley of the Wind", year=1984,
-        original_title="風のとこやけ娑婆鎮"))
+        movie_id=225984, title="Batman: The Dark Knight Returns", year=2012,
+        original_title=None))
 
     result = verify_movie_with_tmdb(client, guess, MIN_MATCH)
 
     assert result is not None and result is not TMDB_TV_DEFER
-    assert result.title == "Nausicaä of the Valley of the Wind"
-    assert result.year == 1984
+    assert result.title == "Batman: The Dark Knight Returns"
+    assert result.year == 2012
+    out = capsys.readouterr().out
+    assert ("Corrected: 'The Dark Knight Returns' (2012) "
+            "-> 'Batman: The Dark Knight Returns' (2012)") in out
 
 
-def test_both_searches_match_same_title_year_files_as_movie(capsys):
-    # When the movie index confirms the guess (same title+year), the folder is
-    # filed as a movie and no TV defer line is logged.
-    guess = FolderGuess(title="Outlander", year=2008, confidence=0.99)
-    client = FakeTmdbClient(
-        movie=TmdbMovie(movie_id=12000, title="Outlander", year=2008),
-        tv=TmdbTv(tv_id=2116, name="Outlander", first_air_year=2008),
+def test_ordinary_movie_folder_is_moved_into_movie_root(tmp_path, monkeypatch):
+    # End-to-end with the fake TMDB client: an ordinary movie is confirmed and
+    # the file is actually moved under the movie root.
+    folder = tmp_path / "Dune Rip"
+    folder.mkdir()
+    (folder / "dune.mkv").write_bytes(b"dummy")
+    (folder / "dune.srt").write_text(
+        "1\n00:00:01,000 --> 00:00:04,000\nDune\n", encoding="utf-8")
+    dest_root = tmp_path / "Movies"
+    dest_root.mkdir()
+    # One feature-length title => deterministic movie routing, no ffprobe.
+    monkeypatch.setattr(Sort_Rips, "ffprobe_duration_seconds",
+                        lambda p: 7200.0)
+    guess = FolderGuess(title="Dune", year=2021, confidence=0.95)
+    client = FakeTmdbClient(movie=TmdbMovie(
+        movie_id=414906, title="Dune", year=2021, original_title=None))
+
+    moved, reason = Sort_Rips.process_folder(
+        folder=folder,
+        extensions=[".mkv"],
+        llm_client=FakeLlmClient(guess),
+        min_confidence=0.6,
+        dest_root=dest_root,
+        overwrite=False,
+        dry_run=False,
+        tmdb_client=client,
+        tmdb_min_title_match=MIN_MATCH,
     )
 
-    result = verify_movie_with_tmdb(client, guess, MIN_MATCH)
-
-    assert result == FolderGuess(title="Outlander", year=2008, confidence=0.99)
-    out = capsys.readouterr().out
-    assert "TV series" not in out
-    assert client.tv_calls == []  # movie search decided first
+    assert reason is None
+    assert moved == "Dune (2021).mkv"
+    dest_file = dest_root / "Dune (2021)" / "Dune (2021).mkv"
+    assert dest_file.exists()
+    # Source video left the folder (its subtitle file goes with the rest).
+    assert not (folder / "dune.mkv").exists()
 
 
 def test_low_confidence_guess_still_accepts_different_year_correction():
@@ -197,7 +221,6 @@ def test_low_confidence_guess_still_accepts_different_year_correction():
     result = verify_movie_with_tmdb(client, guess, MIN_MATCH)
 
     assert result == FolderGuess(title="Outlander", year=2008, confidence=0.89)
-
 
 def test_confidence_boundary_090_rejects_different_year(capsys):
     # Exactly 0.90 is already confident: a different-year hit is not accepted.

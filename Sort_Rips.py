@@ -487,6 +487,8 @@ class TmdbMovieClient:
         top = results[0]
         movie_id = top.get("id")
         canon_title = top.get("title") or top.get("original_title") or ""
+        if not movie_id or not canon_title:
+            return None
         release_date = top.get("release_date") or ""
         release_year: Optional[int] = None
         if release_date:
@@ -530,6 +532,7 @@ class TmdbMovieClient:
 
     def alternative_titles(self, movie_id: int) -> List[str]:
         """All registered alternative titles for a movie (any region). Used to
+        rescue films whose TMDB primary title is a regional/era variant that
         does not match a correct guess (e.g. Nausicaä -> 'Warriors of the Wind')."""
         try:
             data = self._get(f"/movie/{movie_id}/alternative_titles", {})
