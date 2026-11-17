@@ -425,6 +425,20 @@ class TmdbMovie:
     original_title: Optional[str] = None
 
 
+@dataclass
+class TmdbTv:
+    tv_id: int
+    name: str
+    first_air_year: Optional[int]
+    original_name: Optional[str] = None
+
+
+# Sentinel returned by verify_movie_with_tmdb when TMDB identifies the disc as
+# a TV series rather than a movie: file it nowhere in the movie library and
+# leave it for Sort_TV (the caller maps this to TV_DISC_DEFER_REASON).
+TMDB_TV_DEFER = object()
+
+
 def best_title_match(guess_title: str, candidates: Iterable[str]) -> Tuple[Optional[str], float]:
     """Return the candidate most similar to ``guess_title`` and its (normalized)
     score. ``similarity`` strips diacritics/punctuation, so several variants of a
@@ -473,6 +487,8 @@ class TmdbMovieClient:
         top = results[0]
         movie_id = top.get("id")
         canon_title = top.get("title") or top.get("original_title") or ""
+        if not movie_id or not canon_title:
+            return None
         release_date = top.get("release_date") or ""
         release_year: Optional[int] = None
         if release_date:
@@ -480,11 +496,39 @@ class TmdbMovieClient:
                 release_year = int(release_date[:4])
             except (ValueError, IndexError):
                 pass
-        if not movie_id or not canon_title:
-            return None
         original_title = top.get("original_title") or None
         return TmdbMovie(movie_id=int(movie_id), title=str(canon_title),
                          year=release_year, original_title=original_title)
+
+    def search_tv(self, title: str, year: Optional[int] = None) -> Optional[TmdbTv]:
+        """Top TMDB ``/search/tv`` hit (``name`` / ``first_air_date`` fields),
+        or None when the search fails or comes back empty."""
+        params: dict = {"query": title, "include_adult": "false"}
+        if year:
+            params["first_air_date_year"] = str(year)
+        try:
+            data = self._get("/search/tv", params)
+        except Exception as e:
+            print(f"  [TMDB ] TV search failed: {e}")
+            return None
+        results = data.get("results") or []
+        if not results:
+            return None
+        top = results[0]
+        tv_id = top.get("id")
+        name = top.get("name") or top.get("original_name") or ""
+        first_air_date = top.get("first_air_date") or ""
+        first_air_year: Optional[int] = None
+        if first_air_date:
+            try:
+                first_air_year = int(first_air_date[:4])
+            except (ValueError, IndexError):
+                pass
+        if not tv_id or not name:
+            return None
+        return TmdbTv(tv_id=int(tv_id), name=str(name),
+                      first_air_year=first_air_year,
+                      original_name=top.get("original_name") or None)
 
     def alternative_titles(self, movie_id: int) -> List[str]:
         """All registered alternative titles for a movie (any region). Used to
@@ -503,23 +547,66 @@ class TmdbMovieClient:
         return out
 
 
+# A guess at or above this confidence is "confident": a movie hit with a
+# different year than the guess is never accepted as a correction for it
+# (cross-type misfile protection, e.g. Outlander (2014) -> Outlander (2008)).
+CONFIDENT_GUESS_THRESHOLD = 0.9
+
+
+def _tmdb_tv_defer(tmdb: TmdbMovieClient, guess: FolderGuess,
+                   min_match: float) -> Optional[object]:
+    """Consult TMDB's TV index for ``guess``.
+
+    Returns ``TMDB_TV_DEFER`` when the top series matches the guess title and
+    first-aired in the guess's year (so this is a TV season, not a movie), or
+    None when the TV index does not confirm the guess.
+    """
+    tv = tmdb.search_tv(guess.title, guess.year)
+    if tv is None:
+        tv = tmdb.search_tv(guess.title)  # retry without year constraint
+    if tv is None:
+        return None
+    best_name, score = best_title_match(
+        guess.title, [tv.name, tv.original_name or ""]
+    )
+    if score < min_match or not best_name:
+        return None
+    if guess.year is not None and tv.first_air_year != guess.year:
+        return None
+    print(
+        f"  [TMDB ] TMDB identified it as a TV series: '{guess.title}' ({guess.year}), "
+        f"first aired {tv.first_air_year}, deferring to Sort_TV"
+    )
+    return TMDB_TV_DEFER
+
+
 def verify_movie_with_tmdb(
     tmdb: TmdbMovieClient,
     guess: FolderGuess,
     min_match: float,
-) -> Optional[FolderGuess]:
-    """Return a (possibly corrected) FolderGuess if TMDB confirms, else None.
+):
+    """Return a (possibly corrected) FolderGuess if TMDB confirms the disc as a
+    movie, ``TMDB_TV_DEFER`` if TMDB identifies it as a TV series, else None.
 
-    The guess is accepted if it matches the result's primary title, its original
-    title, or — only when those fall short — any of the movie's registered
-    alternative titles. The output keeps whichever known title best matches the
-    guess, so normal cases canonicalize to TMDB's title while a correct guess is
-    preserved when TMDB's primary title is a regional variant.
+    The movie index decides first. The guess is accepted if it matches the
+    result's primary title, its original title, or — only when those fall
+    short — any of the movie's registered alternative titles. The output keeps
+    whichever known title best matches the guess, so normal cases canonicalize
+    to TMDB's title while a correct guess is preserved when TMDB's primary
+    title is a regional variant.
+
+    Type-aware guard: a confident guess (confidence >= 0.9) is never "corrected"
+    to a movie hit with a different year. In that case the TV index is
+    consulted — a matching series defers the folder to Sort_TV — and otherwise
+    the folder is left unverified instead of misfiled under the movie hit.
     """
     result = tmdb.search_movie(guess.title, guess.year)
     if result is None:
         result = tmdb.search_movie(guess.title)  # retry without year constraint
     if result is None:
+        tv_defer = _tmdb_tv_defer(tmdb, guess, min_match)
+        if tv_defer is not None:
+            return tv_defer
         print(f"  [TMDB ] No results for '{guess.title}'")
         return None
 
@@ -540,24 +627,43 @@ def verify_movie_with_tmdb(
                 )
 
     if score < min_match or not best_title:
+        # Movie index does not confirm the guess; a same-year TV series might.
+        tv_defer = _tmdb_tv_defer(tmdb, guess, min_match)
+        if tv_defer is not None:
+            return tv_defer
         print(
             f"  [TMDB ] Title mismatch: '{guess.title}' vs '{result.title}' "
             f"(best score={score:.2f} < {min_match:.2f})"
         )
         return None
 
-    corrected = (
-        norm_title(guess.title) != norm_title(best_title)
-        or guess.year != result.year
-    )
-    if corrected:
-        print(
-            f"  [TMDB ] Corrected: '{guess.title}' ({guess.year}) "
-            f"-> '{best_title}' ({result.year})"
-        )
-    else:
-        print(f"  [TMDB ] Confirmed: '{best_title}' ({result.year}) (score={score:.2f})")
+    if guess.year is None or result.year == guess.year:
+        # Same-year confirmation (or unknown guess year): canonicalize as before.
+        corrected = norm_title(guess.title) != norm_title(best_title)
+        if corrected:
+            print(
+                f"  [TMDB ] Corrected: '{guess.title}' ({guess.year}) "
+                f"-> '{best_title}' ({result.year})"
+            )
+        else:
+            print(f"  [TMDB ] Confirmed: '{best_title}' ({result.year}) (score={score:.2f})")
+        return FolderGuess(title=best_title, year=result.year, confidence=guess.confidence)
 
+    # The movie hit is a different year than the guess.
+    if guess.confidence >= CONFIDENT_GUESS_THRESHOLD:
+        print(
+            f"  [TMDB ] Rejected cross-type correction: {guess.title} ({guess.year}) "
+            f"conf={guess.confidence:.2f}, not accepting {result.title} ({result.year})"
+        )
+        # Never file a confident guess under a different-year movie; the TV
+        # index might explain it (a series that shares the movie's name).
+        return _tmdb_tv_defer(tmdb, guess, min_match)
+
+    # Low-confidence guess: a different-year correction is acceptable, as before.
+    print(
+        f"  [TMDB ] Corrected: '{guess.title}' ({guess.year}) "
+        f"-> '{best_title}' ({result.year})"
+    )
     return FolderGuess(title=best_title, year=result.year, confidence=guess.confidence)
 
 
@@ -719,12 +825,15 @@ def _finalize(
     tmdb_min_title_match: float,
     extra_files: Optional[List[Path]] = None,
 ) -> Optional[str]:
-    """Return the destination filename on success, None if skipped."""
+    """Return the destination filename on success, ``TMDB_TV_DEFER`` when TMDB
+    identifies the disc as a TV series, or None if skipped."""
     if tmdb_client is not None:
         verified = verify_movie_with_tmdb(tmdb_client, guess, tmdb_min_title_match)
         if verified is None:
             print(f"SKIP: TMDB could not confirm '{guess.title}' — preventing bad rename")
             return None
+        if verified is TMDB_TV_DEFER:
+            return TMDB_TV_DEFER
         guess = verified
     return rename_and_move(largest_file, guess, dest_root, overwrite, dry_run, extra_files=extra_files)
 
@@ -782,6 +891,8 @@ def process_folder(
     # before committing — never finalize on the folder name alone.
     if subtitle_text and guess.confidence >= min_confidence:
         result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match, extra_files=extra_files)
+        if result is TMDB_TV_DEFER:
+            return None, TV_DISC_DEFER_REASON
         if result:
             return result, None
         return None, f"TMDB could not confirm '{guess.title}'"
@@ -843,6 +954,8 @@ def process_folder(
         # successful transcript) — never on the folder name alone.
         if guess.confidence >= min_confidence and (subtitle_text or audio_clips):
             result = _finalize(largest_file, guess, dest_root, overwrite, dry_run, tmdb_client, tmdb_min_title_match, extra_files=extra_files)
+            if result is TMDB_TV_DEFER:
+                return None, TV_DISC_DEFER_REASON
             if result:
                 return result, None
             return None, f"TMDB could not confirm '{guess.title}'"
